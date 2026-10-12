@@ -478,7 +478,7 @@ enum CursorSubcommand {
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
-    #[command(about = "Sync Cursor API usage into cursor-cache/usage*.csv")]
+    #[command(about = "Sync Cursor API usage into cursor-cache/usage*.json")]
     Sync {
         #[arg(long, help = "Output as JSON")]
         json: bool,
