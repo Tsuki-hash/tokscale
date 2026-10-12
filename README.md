@@ -64,7 +64,7 @@
 | <img width="48px" src=".github/assets/client-copilot.jpg" alt="Copilot" /> | [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-the-github-copilot-coding-agent-in-cli) | `~/.copilot/session-store.db` (CLI usage events; no OTEL required), `~/.copilot/otel/*.jsonl` (+ `COPILOT_OTEL_FILE_EXPORTER_PATH`), `~/.copilot/data.db` |
 | <img width="48px" src=".github/assets/client-hermes.png" alt="Hermes Agent" /> | [Hermes Agent](https://github.com/NousResearch/hermes-agent) | `$HERMES_HOME/state.db` and `$HERMES_HOME/profiles/*/state.db` (fallback: `~/.hermes/...`) |
 | <img width="48px" src=".github/assets/client-gemini.png" alt="Gemini" /> | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `$GEMINI_CLI_HOME/tmp/*/chats/*.json` (fallback: `~/.gemini/tmp/*/chats/*.json`) |
-| <img width="48px" src=".github/assets/client-cursor.jpg" alt="Cursor" /> | [Cursor IDE](https://cursor.com/) | Cursor API export cached at `~/.config/tokscale/cursor-cache/usage*.csv` (desktop auto-login or cookie paste; not `~/.cursor`) |
+| <img width="48px" src=".github/assets/client-cursor.jpg" alt="Cursor" /> | [Cursor IDE](https://cursor.com/) | Cursor API usage cached at `~/.config/tokscale/cursor-cache/usage*.json` (legacy `usage*.csv` caches are still read; desktop auto-login or cookie paste; not `~/.cursor`) |
 | <img width="48px" src=".github/assets/client-amp.png" alt="Amp" /> | [Amp (AmpCode)](https://ampcode.com/) | `~/.local/share/amp/threads/` |
 | <img width="48px" src=".github/assets/client-codebuff.png" alt="Codebuff" /> | [Codebuff](https://codebuff.com/) | `~/.config/manicode/` (+ `manicode-dev`, `manicode-staging`; override via `CODEBUFF_DATA_DIR`) |
 | <img width="48px" src=".github/assets/client-freebuff.png" alt="Freebuff" /> | [Freebuff](https://github.com/CodebuffAI/freebuff) | shares `~/.config/manicode/` with Codebuff (same runtime); token usage is estimated from the transcript (no local usage; override via `FREEBUFF_DATA_DIR`) |
@@ -611,15 +611,15 @@ Scheduled runs are non-interactive: they never prompt for GitHub auth or star co
 
 ### Cursor IDE Commands
 
-Cursor IDE support uses Cursor's web API export, cached by Tokscale at `~/.config/tokscale/cursor-cache/usage*.csv`. Tokscale does not parse local Cursor Agent CLI state under `~/.cursor`, and it does not treat the desktop SQLite DB as a usage ledger.
+Cursor IDE support uses Cursor's web usage API, cached by Tokscale at `~/.config/tokscale/cursor-cache/usage*.json`. Tokscale does not parse local Cursor Agent CLI state under `~/.cursor`, and it does not treat the desktop SQLite DB as a usage ledger.
 
-When the Cursor desktop app is installed and signed in, `tokscale cursor login` prefers the local `cursorAuth/accessToken` from Cursor's `state.vscdb` and builds the session cookie automatically. `tokscale cursor sync` also refreshes that token when available. Usage rows still come only from Cursor's usage-export API.
+When the Cursor desktop app is installed and signed in, `tokscale cursor login` prefers the local `cursorAuth/accessToken` from Cursor's `state.vscdb` and builds the session cookie automatically. `tokscale cursor sync` also refreshes that token when available. Usage rows still come only from Cursor's usage API.
 
 Setup (desktop auto-login):
 
 1. Sign in to the Cursor desktop app.
 2. Run `tokscale cursor login --name work` (auto-detects the local desktop session when available).
-3. Run `tokscale cursor sync --json` to populate `~/.config/tokscale/cursor-cache/usage.csv`.
+3. Run `tokscale cursor sync --json` to populate `~/.config/tokscale/cursor-cache/usage.json`.
 4. Run `tokscale --client cursor` or any report command.
 
 Fallback (manual browser cookie), if desktop login is unavailable:
@@ -647,7 +647,10 @@ tokscale cursor accounts
 # Manually refresh cached Cursor usage
 tokscale cursor sync --json
 
-# Switch active account (controls which account syncs to cursor-cache/usage.csv)
+# Give a slow or very large account more time (overall budget in seconds)
+tokscale cursor sync --timeout 600
+
+# Switch active account (controls which account syncs to cursor-cache/usage.json)
 tokscale cursor switch work
 
 # Logout from a specific account (keeps history; excludes it from aggregation)
@@ -663,9 +666,19 @@ tokscale cursor logout --all
 tokscale cursor logout --all --purge-cache
 ```
 
-By default, Tokscale aggregates usage across all saved Cursor accounts by reading `cursor-cache/usage*.csv`. The active account syncs to `usage.csv`; additional accounts sync to `usage.<account>.csv`.
+By default, Tokscale aggregates usage across all saved Cursor accounts by reading `cursor-cache/usage*.json`. The active account syncs to `usage.json`; additional accounts sync to `usage.<account>.json`. Legacy CSV caches from older Tokscale versions (`usage.csv`, `usage.<account>.csv`) are still read for an account that has no JSON cache yet. The next successful sync of that account writes its JSON cache and moves the CSV to `cursor-cache/archive/`.
 
 When you log out, Tokscale moves cached usage to `cursor-cache/archive/` so it is no longer aggregated. Use `--purge-cache` to delete cached usage instead.
+
+`tokscale cursor sync` downloads each saved account's usage history page by page and gives each account one overall time budget. By default the budget starts at 120 seconds and grows with the number of usage events Cursor reports for the account, up to 1800 seconds (30 minutes). To use a fixed budget instead, pass `--timeout <SECONDS>` for one run, or save `cursor.syncTimeoutSeconds` in `~/.config/tokscale/settings.json`. Both accept 1-86400. The flag takes precedence over the setting, and the setting takes precedence over the default budget.
+
+```json
+{
+  "cursor": {
+    "syncTimeoutSeconds": 600
+  }
+}
+```
 
 ### Antigravity Commands
 
@@ -952,6 +965,7 @@ Tokscale stores settings in `~/.config/tokscale/settings.json`:
 | `light.writeCache` | boolean | `false` | When true, `tokscale --light` overwrites the TUI cache atomically after rendering. CLI flags `--write-cache` / `--no-write-cache` override per-invocation. |
 | `minutelyTabEnabled` | boolean | `false` | Show the per-minute Minutely tab in the TUI and aggregate per-minute usage during data loading. Default-off because minute-granularity is a niche/diagnostic view for most users and the per-minute bucketing has a non-trivial cost on large datasets. |
 | `autosubmit` | object | disabled | Saved `tokscale autosubmit` state: interval, client/date filters, scheduler backend, last run time, and last error. Prefer `tokscale autosubmit enable/status/disable` over editing this object by hand. |
+| `cursor.syncTimeoutSeconds` | number | unset | Overall time budget, in seconds (1-86400), for each account's usage download in `tokscale cursor sync`. When unset, the budget starts at 120 s and grows with the number of usage events Cursor reports, up to 1800 s. `tokscale cursor sync --timeout <SECONDS>` overrides it for one run. See [Cursor IDE Commands](#cursor-ide-commands). |
 | `scanner.extraScanPaths` | object | `{}` | Additional per-client scan roots for sessions outside Tokscale's default home-root locations |
 | `scanner.bucketTimezone` | string | auto-detected | IANA name of the timezone this device buckets usage days into (e.g. `"Asia/Seoul"`). Recorded automatically on first run. Prefer `tokscale config set timezone <zone>` over editing this by hand. |
 
@@ -1520,7 +1534,7 @@ AI coding tools store their session data in cross-platform locations. Most tools
 | Hermes Agent | `~/.hermes/` | `%USERPROFILE%\.hermes\` | Configurable via `HERMES_HOME` env var ([source](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/session-storage.md)) |
 | Gemini CLI | `~/.gemini/` | `%USERPROFILE%\.gemini\` | Configurable via `GEMINI_CLI_HOME` env var |
 | Amp | `~/.local/share/amp/` | `%USERPROFILE%\.local\share\amp\` | Uses `xdg-basedir` like OpenCode |
-| Cursor | API sync | API sync | Data fetched from Cursor API and cached as `usage*.csv`; desktop auto-login reads auth only from `state.vscdb`; local `~/.cursor` session data is not parsed |
+| Cursor | API sync | API sync | Data fetched from Cursor API and cached as `usage*.json` (legacy `usage*.csv` caches are still read); desktop auto-login reads auth only from `state.vscdb`; local `~/.cursor` session data is not parsed |
 | Droid | `~/.factory/` | `%USERPROFILE%\.factory\` | Same path on all platforms |
 | Pi | `~/.pi/` | `%USERPROFILE%\.pi\` | Same path on all platforms |
 | Oh My Pi | `~/.omp/` | `%USERPROFILE%\.omp\` | Same path on all platforms ([Oh My Pi](https://github.com/can1357/oh-my-pi)) |
@@ -1785,7 +1799,7 @@ Session files containing message arrays:
 
 ### Cursor IDE
 
-Location: `~/.config/tokscale/cursor-cache/usage*.csv` (synced via Cursor API)
+Location: `~/.config/tokscale/cursor-cache/usage*.json` (synced via Cursor API; legacy `usage*.csv` caches are still read when no JSON cache exists for the same account)
 
 Cursor usage is fetched from the Cursor API using a session token and cached locally. Auth can be imported from the Cursor desktop `state.vscdb` (`cursorAuth/accessToken` only) or pasted as a browser cookie. Tokscale reads the API cache files for reports; it does not parse local `~/.cursor` session data or desktop usage tables. See [Cursor IDE Commands](#cursor-ide-commands) for setup.
 

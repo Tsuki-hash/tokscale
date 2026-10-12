@@ -64,7 +64,7 @@
 | <img width="48px" src=".github/assets/client-copilot.jpg" alt="Copilot" /> | [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-the-github-copilot-coding-agent-in-cli) | `~/.copilot/session-store.db`（CLI 使用イベント; OTEL 不要）、`~/.copilot/otel/*.jsonl` (+ `COPILOT_OTEL_FILE_EXPORTER_PATH`)、`~/.copilot/data.db` |
 | <img width="48px" src=".github/assets/client-hermes.png" alt="Hermes Agent" /> | [Hermes Agent](https://github.com/NousResearch/hermes-agent) | `$HERMES_HOME/state.db` および `$HERMES_HOME/profiles/*/state.db`（フォールバック: `~/.hermes/...`） |
 | <img width="48px" src=".github/assets/client-gemini.png" alt="Gemini" /> | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `$GEMINI_CLI_HOME/tmp/*/chats/*.json`（フォールバック: `~/.gemini/tmp/*/chats/*.json`） |
-| <img width="48px" src=".github/assets/client-cursor.jpg" alt="Cursor" /> | [Cursor IDE](https://cursor.com/) | Cursor API のエクスポートを `~/.config/tokscale/cursor-cache/usage*.csv` にキャッシュ（デスクトップ自動ログインまたは Cookie 貼り付け；`~/.cursor` ではない） |
+| <img width="48px" src=".github/assets/client-cursor.jpg" alt="Cursor" /> | [Cursor IDE](https://cursor.com/) | Cursor API の使用量を `~/.config/tokscale/cursor-cache/usage*.json` にキャッシュ（旧形式の `usage*.csv` キャッシュも引き続き読み込み；デスクトップ自動ログインまたは Cookie 貼り付け；`~/.cursor` ではない） |
 | <img width="48px" src=".github/assets/client-amp.png" alt="Amp" /> | [Amp (AmpCode)](https://ampcode.com/) | `~/.local/share/amp/threads/` |
 | <img width="48px" src=".github/assets/client-codebuff.png" alt="Codebuff" /> | [Codebuff](https://codebuff.com/) | `~/.config/manicode/` (+ `manicode-dev`、`manicode-staging`; `CODEBUFF_DATA_DIR` でオーバーライド可能) |
 | <img width="48px" src=".github/assets/client-freebuff.png" alt="Freebuff" /> | [Freebuff](https://github.com/CodebuffAI/freebuff) | Codebuff と同じ `~/.config/manicode/` を共有（同一ランタイム）；トークン使用量はトランスクリプトから推定（ローカル使用量なし；`FREEBUFF_DATA_DIR` でオーバーライド可能） |
@@ -613,15 +613,15 @@ tokscale autosubmit disable
 
 ### Cursor IDEコマンド
 
-Cursor IDE は Cursor のウェブ用量エクスポート API を使い、Tokscale が `~/.config/tokscale/cursor-cache/usage*.csv` にキャッシュします。Tokscale は `~/.cursor` 配下の Cursor Agent CLI ローカル状態を解析しません。また、デスクトップの SQLite DB を使用量台帳としては扱いません。
+Cursor IDE は Cursor のウェブ使用量 API を使い、Tokscale が `~/.config/tokscale/cursor-cache/usage*.json` にキャッシュします。Tokscale は `~/.cursor` 配下の Cursor Agent CLI ローカル状態を解析しません。また、デスクトップの SQLite DB を使用量台帳としては扱いません。
 
-Cursor デスクトップアプリがインストール済みでサインイン済みの場合、`tokscale cursor login` は Cursor の `state.vscdb` から `cursorAuth/accessToken` を優先して読み取り、セッション Cookie を自動構築します。`tokscale cursor sync` も利用可能ならそのトークンを更新します。使用量行は引き続き Cursor の usage-export API からのみ取得します。
+Cursor デスクトップアプリがインストール済みでサインイン済みの場合、`tokscale cursor login` は Cursor の `state.vscdb` から `cursorAuth/accessToken` を優先して読み取り、セッション Cookie を自動構築します。`tokscale cursor sync` も利用可能ならそのトークンを更新します。使用量行は引き続き Cursor の使用量 API からのみ取得します。
 
 セットアップ（デスクトップ自動ログイン）:
 
 1. Cursor デスクトップアプリにサインインする。
 2. `tokscale cursor login --name work` を実行する（ローカルデスクトップセッションがあれば自動検出）。
-3. `tokscale cursor sync --json` を実行して `~/.config/tokscale/cursor-cache/usage.csv` を埋める。
+3. `tokscale cursor sync --json` を実行して `~/.config/tokscale/cursor-cache/usage.json` を埋める。
 4. `tokscale --client cursor` または任意のレポートコマンドを実行する。
 
 フォールバック（手動でブラウザ Cookie を貼り付け）— デスクトップログインが使えない場合:
@@ -646,7 +646,10 @@ tokscale cursor accounts
 # キャッシュされたCursor使用量を手動で更新
 tokscale cursor sync --json
 
-# アクティブアカウントを切り替え（cursor-cache/usage.csvに同期されるアカウント）
+# 遅いアカウントや使用量が非常に多いアカウントに時間を多めに与える（全体の予算、秒単位）
+tokscale cursor sync --timeout 600
+
+# アクティブアカウントを切り替え（cursor-cache/usage.jsonに同期されるアカウント）
 tokscale cursor switch work
 
 # 特定アカウントからログアウト（履歴は保持、集計から除外）
@@ -662,11 +665,21 @@ tokscale cursor logout --all
 tokscale cursor logout --all --purge-cache
 ```
 
-**資格情報の保存**: Cursorアカウントは`~/.config/tokscale/cursor-credentials.json`に保存されます。使用量データは`~/.config/tokscale/cursor-cache/`にキャッシュされます（アクティブアカウントは`usage.csv`、追加アカウントは`usage.<account>.csv`）。
+**資格情報の保存**: Cursorアカウントは`~/.config/tokscale/cursor-credentials.json`に保存されます。使用量データは`~/.config/tokscale/cursor-cache/`にキャッシュされます（アクティブアカウントは`usage.json`、追加アカウントは`usage.<account>.json`）。
 
-デフォルトでは、tokscale は **保存済みのすべての Cursor アカウントの使用量を合算**します（`cursor-cache/usage*.csv`）。後方互換のため、アクティブアカウントは `cursor-cache/usage.csv` に同期されます。
+デフォルトでは、tokscale は **保存済みのすべての Cursor アカウントの使用量を合算**します（`cursor-cache/usage*.json`）。以前のバージョンの Tokscale が作成した旧形式の CSV キャッシュ（`usage.csv`、`usage.<account>.csv`）も、まだ JSON キャッシュがないアカウントについては引き続き読み込みます。そのアカウントの次回の同期が成功すると、JSON キャッシュを書き込み、CSV を `cursor-cache/archive/` に移動します。
 
 ログアウト時はキャッシュされた履歴を `cursor-cache/archive/` に移動して保持します（そのため集計には含まれません）。完全に削除したい場合は `--purge-cache` を使ってください。
+
+`tokscale cursor sync` は、保存済みの各アカウントの使用量履歴をページ単位で取得し、アカウントごとに 1 つの全体時間予算を適用します。既定の予算は 120 秒から始まり、Cursor が報告するそのアカウントの使用量イベント数に応じて最大 1800 秒（30 分）まで延長されます。固定の予算を使うには、1 回の実行だけなら `--timeout <SECONDS>` を指定し、常に使うなら `~/.config/tokscale/settings.json` に `cursor.syncTimeoutSeconds` を保存します。どちらも 1-86400 の値を受け付けます。フラグは設定より優先され、設定は既定の予算より優先されます。
+
+```json
+{
+  "cursor": {
+    "syncTimeoutSeconds": 600
+  }
+}
+```
 
 > ⚠️ **セキュリティ警告**: セッショントークンはパスワードのように扱ってください。公開したり、バージョン管理にコミットしたりしないでください。トークンはCursorアカウントへの完全なアクセス権を付与します。
 
@@ -943,6 +956,7 @@ Tokscaleは設定を`~/.config/tokscale/settings.json`に保存します：
 | `usage.disabledProviders` | string[] | `[]` | 認証情報の検出やネットワークアクセスの前にスキップするサブスクリプション usage プロバイダー。有効な ID（大文字小文字を区別しない、前後の空白は無視）: `claude`, `codex`, `zai`, `amp`, `antigravity`, `copilot`, `grok`, `kimi`, `minimax`, `minimax-token-plan`, `warp`, `sakana`, `opencode-go`。未知の ID は無視されます。無効化されたプロバイダーはキャッシュされた TUI カードや診断からも隠されます。変更は次回の `tokscale usage` 実行または TUI の起動/リフレッシュから適用されます。 |
 | `light.writeCache` | boolean | `false` | `true` のとき、`tokscale --light` はレンダリング直後に TUI キャッシュを原子的に上書きします。CLI フラグ `--write-cache` / `--no-write-cache` が実行ごとに優先されます。 |
 | `minutelyTabEnabled` | boolean | `false` | TUI に分単位の Minutely タブを表示し、データ読み込み時に分単位の集計を実行します。分単位の粒度はほとんどのユーザーにとってニッチな診断ビューであり、大規模データセットでは分単位のバケット処理に無視できないコストがかかるため、既定では無効になっています。 |
+| `cursor.syncTimeoutSeconds` | number | 未設定 | `tokscale cursor sync` で各アカウントの使用量を取得する際の全体時間予算（秒、1-86400）。未設定の場合は 120 秒から始まり、Cursor が報告する使用量イベント数に応じて最大 1800 秒まで延長されます。`tokscale cursor sync --timeout <SECONDS>` が実行ごとに優先されます。[Cursor IDEコマンド](#cursor-ideコマンド)を参照。 |
 | `scanner.extraScanPaths` | object | `{}` | Tokscale のデフォルトのホームルート以外にあるセッション向けの、クライアントごとの追加スキャンルート |
 | `scanner.bucketTimezone` | string | 自動検出 | このデバイスが使用量の日付をバケット化するタイムゾーンの IANA 名（例: `"Asia/Seoul"`）。初回実行時に自動記録されます。手編集ではなく `tokscale config set timezone <zone>` を使用してください。 |
 
@@ -1482,7 +1496,7 @@ AIコーディングツールはクロスプラットフォームの場所にセ
 | Hermes Agent | `~/.hermes/` | `%USERPROFILE%\.hermes\` | `HERMES_HOME`環境変数で設定可能（[ソース](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/session-storage.md)） |
 | Gemini CLI | `~/.gemini/` | `%USERPROFILE%\.gemini\` | `GEMINI_CLI_HOME`環境変数で設定可能 |
 | Amp | `~/.local/share/amp/` | `%USERPROFILE%\.local\share\amp\` | OpenCodeと同様に`xdg-basedir`を使用 |
-| Cursor | API同期 | API同期 | Cursor API から取得したデータを `usage*.csv` としてキャッシュ；デスクトップ自動ログインは `state.vscdb` の認証のみ；ローカルの `~/.cursor` セッションデータは解析しない |
+| Cursor | API同期 | API同期 | Cursor API から取得したデータを `usage*.json` としてキャッシュ（旧形式の `usage*.csv` キャッシュも引き続き読み込み）；デスクトップ自動ログインは `state.vscdb` の認証のみ；ローカルの `~/.cursor` セッションデータは解析しない |
 | Droid | `~/.factory/` | `%USERPROFILE%\.factory\` | すべてのプラットフォームで同じパス |
 | Pi | `~/.pi/` | `%USERPROFILE%\.pi\` | すべてのプラットフォームで同じパス |
 | Oh My Pi | `~/.omp/` | `%USERPROFILE%\.omp\` | すべてのプラットフォームで同じパス（[Oh My Pi](https://github.com/can1357/oh-my-pi)） |
@@ -1707,7 +1721,7 @@ Tokscaleは `chat` spanをトークン集計の信頼源として扱い、ツー
 
 ### Cursor IDE
 
-場所: `~/.config/tokscale/cursor-cache/`（Cursor API経由で同期）
+場所: `~/.config/tokscale/cursor-cache/usage*.json`（Cursor API経由で同期。同じアカウントの JSON キャッシュがなければ、旧形式の `usage*.csv` キャッシュも引き続き読み込み）
 
 CursorデータはセッショントークンでCursor APIから取得され、ローカルにキャッシュされます。認証は Cursor デスクトップの `state.vscdb`（`cursorAuth/accessToken` のみ）から取り込むか、ブラウザ Cookie を貼り付けできます。Tokscale はレポート用に API キャッシュを読みます。ローカルの `~/.cursor` セッションデータやデスクトップの使用量テーブルは解析しません。セットアップ手順は[Cursor IDEコマンド](#cursor-ideコマンド)を参照。
 
