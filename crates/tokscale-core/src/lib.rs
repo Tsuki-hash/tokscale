@@ -999,13 +999,90 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     messages
 }
 
-fn emit_missing_codex_usage_warning(missing_files: usize, inspected_files: usize) {
-    let message = (missing_files > 0).then(|| {
+fn codex_missing_usage_warning(missing_files: usize, inspected_files: usize) -> Option<String> {
+    (missing_files > 0).then(|| {
         format!(
             "Warning: {missing_files} of {inspected_files} inspected rollout files contain Codex activity but no supported usage records for the selected clients. Recorded token totals omit these files. This source-completeness diagnostic covers inspected files independently of the selected report dates."
         )
+    })
+}
+
+fn codex_archive_failure_warning(
+    mut failures: Vec<sessions::codex::CodexArchiveFailure>,
+) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+
+    failures.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.reason.cmp(&right.reason))
     });
-    tui_signal::update_codex_usage_warning(message);
+    failures.dedup_by(|left, right| left.path == right.path);
+    let decode_failures = failures
+        .iter()
+        .filter(|failure| failure.reason == sessions::codex::CodexArchiveFailureReason::Decode)
+        .count();
+    let size_limit_failures = failures
+        .iter()
+        .filter(|failure| {
+            failure.reason == sessions::codex::CodexArchiveFailureReason::DecodedSizeLimit
+        })
+        .count();
+    let open_failures = failures
+        .iter()
+        .filter(|failure| failure.reason == sessions::codex::CodexArchiveFailureReason::Open)
+        .count();
+    let mut categories = Vec::new();
+    if decode_failures > 0 {
+        categories.push(format!(
+            "{decode_failures} decode failure{}",
+            if decode_failures == 1 { "" } else { "s" }
+        ));
+    }
+    if size_limit_failures > 0 {
+        let limit_mib = sessions::utils::MAX_ARCHIVE_BYTES / (1024 * 1024);
+        categories.push(format!(
+            "{size_limit_failures} exceeded the {limit_mib} MiB decoded-size limit"
+        ));
+    }
+    if open_failures > 0 {
+        categories.push(format!(
+            "{open_failures} open failure{}",
+            if open_failures == 1 { "" } else { "s" }
+        ));
+    }
+
+    let total = failures.len();
+    let examples = failures
+        .iter()
+        .take(2)
+        .map(|failure| format!("{:?}", failure.path))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Warning: skipped {total} unreadable compressed Codex rollout file{} ({}). Recorded token totals omit {}. Example{}: {examples}.",
+        if total == 1 { "" } else { "s" },
+        categories.join("; "),
+        if total == 1 { "this file" } else { "these files" },
+        if total == 1 { "" } else { "s" },
+    ))
+}
+
+fn emit_codex_scan_warnings(
+    missing_files: usize,
+    inspected_files: usize,
+    archive_failures: Vec<sessions::codex::CodexArchiveFailure>,
+) {
+    let mut warnings = Vec::new();
+    if let Some(warning) = codex_missing_usage_warning(missing_files, inspected_files) {
+        warnings.push(warning);
+    }
+    if let Some(warning) = codex_archive_failure_warning(archive_failures) {
+        warnings.push(warning);
+    }
+    tui_signal::update_codex_scan_warnings(warnings);
 }
 
 fn parse_all_messages_streaming<S: MessageSink>(
@@ -1053,12 +1130,14 @@ fn parse_all_messages_streaming<S: MessageSink>(
     /// outcome rather than on its messages because it is a property of the
     /// file: the openclaw lane matches OpenClaw's per-turn mirror rows against
     /// it whether the messages were parsed just now or served from the cache.
-    /// The final flag diagnoses own Codex activity without supported usage,
-    /// including sources that emit no messages at all.
+    /// The flags diagnose own Codex activity without supported usage, and the
+    /// optional archive failure keeps an unreadable compressed source visible
+    /// even though failed parses are deliberately never cached.
     type CodexSourceOutcome = (
         CachedParseOutcome,
         sessions::codex::CodexTurnCoverage,
         (bool, bool),
+        Option<sessions::codex::CodexArchiveFailure>,
     );
 
     fn parse_full_log_source(
@@ -1077,6 +1156,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             parsed.is_missing_usage(),
             parsed.state.has_own_synthetic_activity,
         );
+        let archive_failure = parsed.archive_failure.clone();
         let messages = finalize_codex_messages(
             parsed.messages.clone(),
             pricing,
@@ -1094,6 +1174,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 },
                 turn_coverage,
                 missing_usage,
+                archive_failure,
             );
         }
 
@@ -1114,6 +1195,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             },
             turn_coverage,
             missing_usage,
+            archive_failure,
         )
     }
 
@@ -1969,10 +2051,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
 
         if let Some(cached) = cached {
             let reparse_from_start = |invalidate_cache: bool| {
-                let (mut outcome, turn_coverage, missing_usage) =
+                let (mut outcome, turn_coverage, missing_usage, archive_failure) =
                     parse_full_log_source(path, pricing, is_headless);
                 outcome.invalidate_cache = invalidate_cache && outcome.cache_entry.is_none();
-                (outcome, turn_coverage, missing_usage)
+                (outcome, turn_coverage, missing_usage, archive_failure)
             };
 
             if cached.fingerprint == fingerprint {
@@ -2007,6 +2089,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                         },
                         turn_coverage,
                         missing_usage,
+                        None,
                     );
                 }
 
@@ -2065,6 +2148,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                                     },
                                     turn_coverage,
                                     missing_usage,
+                                    None,
                                 );
                             }
                         }
@@ -2302,10 +2386,14 @@ fn parse_all_messages_streaming<S: MessageSink>(
     let inspected_codex_files = codex_outcomes.len();
     let include_codex_diagnostic = include_all || clients.iter().any(|client| client == "codex");
     let mut missing_codex_usage_files = 0;
-    for (path, (outcome, turn_coverage, missing_usage)) in codex_outcomes {
+    let mut codex_archive_failures = Vec::new();
+    for (path, (outcome, turn_coverage, missing_usage, archive_failure)) in codex_outcomes {
         missing_codex_usage_files += usize::from(
             missing_usage.0 && (include_codex_diagnostic || (include_synthetic && missing_usage.1)),
         );
+        if let Some(failure) = archive_failure {
+            codex_archive_failures.push(failure);
+        }
         let mut owned_thread: Option<String> = None;
         let mut counted_under_codex = false;
         for message in outcome.messages {
@@ -2341,8 +2429,6 @@ fn parse_all_messages_streaming<S: MessageSink>(
             );
         }
     }
-
-    emit_missing_codex_usage_warning(missing_codex_usage_files, inspected_codex_files);
 
     // Release Codex before Copilot. This has to sit ahead of the Copilot
     // lane rather than after it: the desktop/vscode blocks below scan
@@ -2671,7 +2757,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
             })
             .collect();
         let mut rollout_messages = std::mem::take(&mut openclaw_owned_rollouts);
-        for (path, (outcome, turn_coverage, _missing_usage)) in rollout_outcomes {
+        for (path, (outcome, turn_coverage, _missing_usage, archive_failure)) in rollout_outcomes {
+            if let Some(failure) = archive_failure {
+                codex_archive_failures.push(failure);
+            }
             let thread_from_name = sessions::codex::thread_id_from_rollout_path(&path);
             let mut recorded_thread: Option<String> = None;
             for mut message in outcome.messages {
@@ -3651,6 +3740,12 @@ fn parse_all_messages_streaming<S: MessageSink>(
             }
         }
     }
+
+    emit_codex_scan_warnings(
+        missing_codex_usage_files,
+        inspected_codex_files,
+        codex_archive_failures,
+    );
 
     if cache_policy == SourceCachePolicy::Persistent {
         source_cache.save_if_dirty();
@@ -5605,6 +5700,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         Vec<UnifiedMessage>,
         sessions::codex::CodexTurnCoverage,
         (bool, bool),
+        Option<sessions::codex::CodexArchiveFailure>,
     );
     let codex_files: Vec<LocalCodexSourceOutcome> = scan_result
         .get(ClientId::Codex)
@@ -5620,6 +5716,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
                 parsed.is_missing_usage(),
                 parsed.state.has_own_synthetic_activity,
             );
+            let archive_failure = parsed.archive_failure.clone();
             let messages = parsed
                 .messages
                 .into_iter()
@@ -5633,6 +5730,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
                 messages,
                 parsed.state.turn_coverage,
                 missing_usage,
+                archive_failure,
             )
         })
         .collect();
@@ -5650,10 +5748,14 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let inspected_codex_files = codex_files.len();
     let include_codex_diagnostic = include_all || requested.contains("codex");
     let mut missing_codex_usage_files = 0;
-    for (path, file_messages, turn_coverage, missing_usage) in codex_files {
+    let mut codex_archive_failures = Vec::new();
+    for (path, file_messages, turn_coverage, missing_usage, archive_failure) in codex_files {
         missing_codex_usage_files += usize::from(
             missing_usage.0 && (include_codex_diagnostic || (include_synthetic && missing_usage.1)),
         );
+        if let Some(failure) = archive_failure {
+            codex_archive_failures.push(failure);
+        }
         let mut owned_thread: Option<String> = None;
         let mut counted_under_codex = false;
         for message in file_messages {
@@ -5683,7 +5785,6 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
             }
         }
     }
-    emit_missing_codex_usage_warning(missing_codex_usage_files, inspected_codex_files);
     let codex_count = codex_msgs.len() as i32;
     counts.set(ClientId::Codex, codex_count);
     messages.extend(codex_msgs);
@@ -5854,33 +5955,40 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
             }
         }
         let mut rollout_messages: Vec<UnifiedMessage> = openclaw_owned_rollouts;
-        let location_rollouts: Vec<(Vec<UnifiedMessage>, sessions::codex::CodexTurnCoverage)> =
-            openclaw_codex_rollouts
-                .par_iter()
-                .map(|path| {
-                    let thread_from_name = sessions::codex::thread_id_from_rollout_path(path);
-                    let parsed = sessions::codex::parse_codex_file_incremental(
-                        path,
-                        0,
-                        sessions::codex::CodexParseState::default(),
-                    );
-                    let messages = parsed
-                        .messages
-                        .into_iter()
-                        .map(|mut message| {
-                            if message.client != sessions::codex::OPENCLAW_CLIENT_ID {
-                                message.client = sessions::codex::OPENCLAW_CLIENT_ID.to_string();
-                                if let Some(thread) = &thread_from_name {
-                                    message.session_id = thread.clone();
-                                }
+        let location_rollouts: Vec<(
+            Vec<UnifiedMessage>,
+            sessions::codex::CodexTurnCoverage,
+            Option<sessions::codex::CodexArchiveFailure>,
+        )> = openclaw_codex_rollouts
+            .par_iter()
+            .map(|path| {
+                let thread_from_name = sessions::codex::thread_id_from_rollout_path(path);
+                let parsed = sessions::codex::parse_codex_file_incremental(
+                    path,
+                    0,
+                    sessions::codex::CodexParseState::default(),
+                );
+                let archive_failure = parsed.archive_failure.clone();
+                let messages = parsed
+                    .messages
+                    .into_iter()
+                    .map(|mut message| {
+                        if message.client != sessions::codex::OPENCLAW_CLIENT_ID {
+                            message.client = sessions::codex::OPENCLAW_CLIENT_ID.to_string();
+                            if let Some(thread) = &thread_from_name {
+                                message.session_id = thread.clone();
                             }
-                            message
-                        })
-                        .collect::<Vec<_>>();
-                    (messages, parsed.state.turn_coverage)
-                })
-                .collect();
-        for (messages, turn_coverage) in location_rollouts {
+                        }
+                        message
+                    })
+                    .collect::<Vec<_>>();
+                (messages, parsed.state.turn_coverage, archive_failure)
+            })
+            .collect();
+        for (messages, turn_coverage, archive_failure) in location_rollouts {
+            if let Some(failure) = archive_failure {
+                codex_archive_failures.push(failure);
+            }
             if let Some(first) = messages.first() {
                 recorded_codex_turns.record(&first.session_id, &turn_coverage);
             }
@@ -5929,6 +6037,11 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let openclaw_count = openclaw_msgs.len() as i32;
     counts.set(ClientId::OpenClaw, openclaw_count);
     messages.extend(openclaw_msgs);
+    emit_codex_scan_warnings(
+        missing_codex_usage_files,
+        inspected_codex_files,
+        codex_archive_failures,
+    );
 
     // Pi branch/fork copies prior assistant records into a new session file
     // (#1306); the parser stamps cross-session keys, drop the copies here too
@@ -7435,6 +7548,13 @@ mod tests {
             .collect()
     }
 
+    fn take_codex_archive_warnings() -> Vec<String> {
+        crate::tui_signal::take_deferred_stderr_for_test()
+            .into_iter()
+            .filter(|message| message.contains("unreadable compressed Codex rollout"))
+            .collect()
+    }
+
     #[test]
     #[serial]
     fn codex_plain_and_compressed_fallback_rows_dedup_cold_warm_and_local() {
@@ -7519,6 +7639,89 @@ mod tests {
                 .map(|message| message.input)
                 .sum::<i64>(),
             27
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unreadable_codex_archives_warn_on_cached_and_local_scans() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let mut tui = crate::tui_signal::TuiActiveGuard::capture();
+        tui.set(true);
+        let sessions = source_home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let content = concat!(
+            r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-10-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120},"last_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}"#,
+            "\n"
+        );
+        let encoded = zstd::encode_all(content.as_bytes(), 0).unwrap();
+        let good_path = sessions.join("good.jsonl.zst");
+        let corrupt_path = sessions.join("corrupt.jsonl.zst");
+        let truncated_path = sessions.join("truncated.jsonl.zst");
+        let capped_path = sessions.join("capped.jsonl.zst");
+        std::fs::write(&good_path, &encoded).unwrap();
+        std::fs::write(&corrupt_path, b"not a zstd stream").unwrap();
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        std::fs::write(&truncated_path, truncated).unwrap();
+        std::fs::write(&capped_path, &encoded).unwrap();
+        let limit = sessions::codex::register_archive_limit_override(&capped_path, 32);
+
+        let clients = vec!["codex".to_string()];
+        let home = source_home.path().to_str().unwrap();
+        let scan_cached = || parse_all_messages_with_pricing(home, &clients, None);
+        let assert_warning = |warning: &str| {
+            assert!(warning.contains("skipped 3 unreadable compressed Codex rollout files"));
+            assert!(warning.contains("2 decode failures"));
+            assert!(warning.contains("1 exceeded the 256 MiB decoded-size limit"));
+            assert!(warning.contains("Recorded token totals omit these files"));
+            assert_eq!(
+                warning.matches(".jsonl.zst").count(),
+                2,
+                "the aggregate should expose at most two escaped example paths"
+            );
+        };
+
+        let cold = scan_cached();
+        assert_eq!(cold.len(), 1);
+        assert_eq!(cold[0].session_id, "good");
+        let warnings = take_codex_archive_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_warning(&warnings[0]);
+
+        // Failed parses are not cached. Repeated scans must report them again,
+        // while the TUI keeps only the latest aggregate instead of duplicates.
+        for _ in 0..2 {
+            let warm = scan_cached();
+            assert_eq!(warm.len(), 1);
+        }
+        let warnings = take_codex_archive_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_warning(&warnings[0]);
+
+        let direct = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.to_string()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(direct.counts.get(ClientId::Codex), 1);
+        let warnings = take_codex_archive_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_warning(&warnings[0]);
+
+        std::fs::write(&corrupt_path, &encoded).unwrap();
+        std::fs::write(&truncated_path, &encoded).unwrap();
+        drop(limit);
+        assert_eq!(scan_cached().len(), 4);
+        assert!(
+            take_codex_archive_warnings().is_empty(),
+            "a scan of readable archives must clear the stale warning"
         );
     }
 

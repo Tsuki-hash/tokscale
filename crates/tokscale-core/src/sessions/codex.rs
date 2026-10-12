@@ -20,7 +20,12 @@ use crate::TokenBreakdown;
 use serde::Deserialize;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Mutex;
 
 /// Agents-tab bucket for a regular interactive Codex thread. Codex stamps each
 /// spawned thread with a random `agent_nickname` (a scientist/philosopher
@@ -451,12 +456,39 @@ fn codex_originator_is_openclaw(originator: Option<&str>) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("openclaw"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CodexArchiveFailureReason {
+    Decode,
+    DecodedSizeLimit,
+    Open,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexArchiveFailure {
+    pub path: PathBuf,
+    pub reason: CodexArchiveFailureReason,
+}
+
+impl CodexArchiveFailure {
+    fn new(path: &Path, reason: CodexArchiveFailureReason) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            reason,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedCodexFile {
     pub messages: Vec<UnifiedMessage>,
     pub fallback_timestamp_indices: Vec<usize>,
     pub consumed_offset: u64,
     pub parse_succeeded: bool,
+    /// Set only for an I/O or zstd-boundary failure while reading a compressed
+    /// rollout. Malformed decoded JSON remains a parser failure, not an archive
+    /// read failure.
+    pub archive_failure: Option<CodexArchiveFailure>,
+    reader_failed: bool,
     /// True when model-less token_count rows were emitted without a later model.
     pub unresolved_model_events: bool,
     pub state: CodexParseState,
@@ -466,6 +498,68 @@ impl ParsedCodexFile {
     pub(crate) fn is_missing_usage(&self) -> bool {
         self.parse_succeeded && self.state.is_missing_usage()
     }
+}
+
+#[cfg(test)]
+static ARCHIVE_LIMIT_OVERRIDES: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
+
+/// Keeps one path-scoped decoded-size limit installed for a test. The exact
+/// path lookup reaches Rayon workers without a process-wide tuning variable.
+#[cfg(test)]
+pub(crate) struct ArchiveLimitOverrideGuard {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for ArchiveLimitOverrideGuard {
+    fn drop(&mut self) {
+        let Ok(mut overrides) = ARCHIVE_LIMIT_OVERRIDES.lock() else {
+            return;
+        };
+        if let Some(overrides) = overrides.as_mut() {
+            overrides.remove(&self.path);
+        }
+        if matches!(overrides.as_ref(), Some(overrides) if overrides.is_empty()) {
+            *overrides = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn register_archive_limit_override(
+    path: &Path,
+    max_bytes: u64,
+) -> ArchiveLimitOverrideGuard {
+    let path = path.to_path_buf();
+    let inserted = {
+        let mut overrides = ARCHIVE_LIMIT_OVERRIDES.lock().unwrap();
+        let overrides = overrides.get_or_insert_with(HashMap::new);
+        if overrides.contains_key(&path) {
+            false
+        } else {
+            overrides.insert(path.clone(), max_bytes);
+            true
+        }
+    };
+    assert!(
+        inserted,
+        "a Codex archive limit override is already registered for this path"
+    );
+    ArchiveLimitOverrideGuard { path }
+}
+
+fn archive_limit_for_path(_path: &Path) -> u64 {
+    #[cfg(test)]
+    if let Some(max_bytes) = ARCHIVE_LIMIT_OVERRIDES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|overrides| overrides.get(_path).copied())
+    {
+        return max_bytes;
+    }
+
+    MAX_ARCHIVE_BYTES
 }
 
 impl CodexParseState {
@@ -552,6 +646,7 @@ fn parse_codex_reader<R: BufRead>(
     let mut line = String::with_capacity(4096);
     let mut consumed_offset = start_offset;
     let mut parse_succeeded = true;
+    let mut reader_failed = false;
     let mut pending_model_messages = Vec::new();
     let mut unresolved_model_events = false;
 
@@ -562,6 +657,7 @@ fn parse_codex_reader<R: BufRead>(
             Ok(bytes_read) => bytes_read,
             Err(_) => {
                 parse_succeeded = false;
+                reader_failed = true;
                 break;
             }
         };
@@ -1212,6 +1308,8 @@ fn parse_codex_reader<R: BufRead>(
         fallback_timestamp_indices,
         consumed_offset,
         parse_succeeded,
+        archive_failure: None,
+        reader_failed,
         unresolved_model_events,
         state,
     }
@@ -1530,6 +1628,23 @@ fn forked_child_should_skip_inherited_snapshot(
     false
 }
 
+fn failed_codex_parse(
+    state: CodexParseState,
+    consumed_offset: u64,
+    archive_failure: Option<CodexArchiveFailure>,
+) -> ParsedCodexFile {
+    ParsedCodexFile {
+        messages: Vec::new(),
+        fallback_timestamp_indices: Vec::new(),
+        consumed_offset,
+        parse_succeeded: false,
+        archive_failure,
+        reader_failed: false,
+        unresolved_model_events: false,
+        state,
+    }
+}
+
 pub(crate) fn parse_codex_file_incremental(
     path: &Path,
     start_offset: u64,
@@ -1540,60 +1655,63 @@ pub(crate) fn parse_codex_file_incremental(
 
     if is_zst_path(path) {
         if start_offset != 0 {
-            return ParsedCodexFile {
-                messages: Vec::new(),
-                fallback_timestamp_indices: Vec::new(),
-                consumed_offset: start_offset,
-                parse_succeeded: false,
-                unresolved_model_events: false,
-                state,
-            };
+            return failed_codex_parse(state, start_offset, None);
         }
 
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "Skipping Codex archive");
-                return ParsedCodexFile {
-                    messages: Vec::new(),
-                    fallback_timestamp_indices: Vec::new(),
-                    consumed_offset: 0,
-                    parse_succeeded: false,
-                    unresolved_model_events: false,
+            Err(_) => {
+                return failed_codex_parse(
                     state,
-                };
+                    0,
+                    Some(CodexArchiveFailure::new(
+                        path,
+                        CodexArchiveFailureReason::Open,
+                    )),
+                );
             }
         };
 
         let mut decoder = match zstd::stream::read::Decoder::new(file) {
-            Ok(d) => d,
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "Skipping Codex archive");
-                return ParsedCodexFile {
-                    messages: Vec::new(),
-                    fallback_timestamp_indices: Vec::new(),
-                    consumed_offset: 0,
-                    parse_succeeded: false,
-                    unresolved_model_events: false,
+            Ok(decoder) => decoder,
+            Err(_) => {
+                return failed_codex_parse(
                     state,
-                };
+                    0,
+                    Some(CodexArchiveFailure::new(
+                        path,
+                        CodexArchiveFailureReason::Decode,
+                    )),
+                );
             }
         };
-        if let Err(error) = decoder.window_log_max(26) {
-            tracing::warn!(path = %path.display(), %error, "Skipping Codex archive");
-            return ParsedCodexFile {
-                messages: Vec::new(),
-                fallback_timestamp_indices: Vec::new(),
-                consumed_offset: 0,
-                parse_succeeded: false,
-                unresolved_model_events: false,
+        if decoder.window_log_max(26).is_err() {
+            return failed_codex_parse(
                 state,
-            };
+                0,
+                Some(CodexArchiveFailure::new(
+                    path,
+                    CodexArchiveFailureReason::Decode,
+                )),
+            );
         }
 
-        let reader = BufReader::new(decoder.take(MAX_ARCHIVE_BYTES + 1));
+        let archive_limit = archive_limit_for_path(path);
+        let reader = BufReader::new(decoder.take(archive_limit.saturating_add(1)));
         let mut parsed = parse_codex_reader(reader, &session_id, fallback_timestamp, 0, state);
-        if parsed.consumed_offset > MAX_ARCHIVE_BYTES || !parsed.parse_succeeded {
+        let failure_reason = if parsed.consumed_offset > archive_limit {
+            Some(CodexArchiveFailureReason::DecodedSizeLimit)
+        } else if parsed.reader_failed {
+            // Corrupt/truncated frames and frames whose window exceeds the
+            // configured zstd maximum surface as reader failures.
+            Some(CodexArchiveFailureReason::Decode)
+        } else {
+            None
+        };
+        if let Some(reason) = failure_reason {
+            parsed.archive_failure = Some(CodexArchiveFailure::new(path, reason));
+        }
+        if parsed.archive_failure.is_some() || !parsed.parse_succeeded {
             parsed.messages.clear();
             parsed.fallback_timestamp_indices.clear();
             parsed.parse_succeeded = false;
@@ -1603,27 +1721,11 @@ pub(crate) fn parse_codex_file_incremental(
 
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(_) => {
-            return ParsedCodexFile {
-                messages: Vec::new(),
-                fallback_timestamp_indices: Vec::new(),
-                consumed_offset: start_offset,
-                parse_succeeded: false,
-                unresolved_model_events: false,
-                state,
-            };
-        }
+        Err(_) => return failed_codex_parse(state, start_offset, None),
     };
 
     if file.seek(SeekFrom::Start(start_offset)).is_err() {
-        return ParsedCodexFile {
-            messages: Vec::new(),
-            fallback_timestamp_indices: Vec::new(),
-            consumed_offset: start_offset,
-            parse_succeeded: false,
-            unresolved_model_events: false,
-            state,
-        };
+        return failed_codex_parse(state, start_offset, None);
     }
 
     let reader = BufReader::new(file);
@@ -4443,24 +4545,59 @@ mod tests {
 
         let incremental = parse_codex_file_incremental(&zst_path, 0, CodexParseState::default());
         assert!(incremental.parse_succeeded);
+        assert!(incremental.archive_failure.is_none());
         assert_eq!(incremental.messages, expected);
     }
 
     #[test]
-    fn invalid_or_truncated_compressed_codex_archive_does_not_emit_partial_usage() {
+    fn unreadable_compressed_codex_archives_report_typed_failures_without_partial_usage() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("rollout.jsonl.zst");
         let content = br#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}
 {"timestamp":"2026-10-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150},"last_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}}}"#;
+
+        let truncated_path = dir.path().join("truncated.jsonl.zst");
         let mut bytes = zstd::encode_all(&content[..], 0).unwrap();
         bytes.pop();
-        std::fs::write(&path, bytes).unwrap();
-        assert!(parse_codex_file(&path).is_empty());
-        let incremental = parse_codex_file_incremental(&path, 0, CodexParseState::default());
-        assert!(!incremental.parse_succeeded);
-        assert!(incremental.messages.is_empty());
+        std::fs::write(&truncated_path, bytes).unwrap();
+        assert!(parse_codex_file(&truncated_path).is_empty());
+        let truncated =
+            parse_codex_file_incremental(&truncated_path, 0, CodexParseState::default());
+        assert!(!truncated.parse_succeeded);
+        assert!(truncated.messages.is_empty());
+        assert_eq!(
+            truncated.archive_failure,
+            Some(CodexArchiveFailure::new(
+                &truncated_path,
+                CodexArchiveFailureReason::Decode
+            ))
+        );
 
-        std::fs::write(&path, b"not a zstd stream").unwrap();
-        assert!(parse_codex_file(&path).is_empty());
+        let corrupt_path = dir.path().join("corrupt.jsonl.zst");
+        std::fs::write(&corrupt_path, b"not a zstd stream").unwrap();
+        assert!(parse_codex_file(&corrupt_path).is_empty());
+        let corrupt = parse_codex_file_incremental(&corrupt_path, 0, CodexParseState::default());
+        assert!(!corrupt.parse_succeeded);
+        assert!(corrupt.messages.is_empty());
+        assert_eq!(
+            corrupt.archive_failure,
+            Some(CodexArchiveFailure::new(
+                &corrupt_path,
+                CodexArchiveFailureReason::Decode
+            ))
+        );
+
+        let capped_path = dir.path().join("capped.jsonl.zst");
+        std::fs::write(&capped_path, zstd::encode_all(&content[..], 0).unwrap()).unwrap();
+        let _limit = register_archive_limit_override(&capped_path, 32);
+        let capped = parse_codex_file_incremental(&capped_path, 0, CodexParseState::default());
+        assert!(!capped.parse_succeeded);
+        assert!(capped.messages.is_empty());
+        assert_eq!(
+            capped.archive_failure,
+            Some(CodexArchiveFailure::new(
+                &capped_path,
+                CodexArchiveFailureReason::DecodedSizeLimit
+            ))
+        );
     }
 }
