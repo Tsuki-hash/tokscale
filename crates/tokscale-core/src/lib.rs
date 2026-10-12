@@ -7437,6 +7437,93 @@ mod tests {
 
     #[test]
     #[serial]
+    fn codex_plain_and_compressed_fallback_rows_dedup_cold_warm_and_local() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let sessions = source_home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // No session_meta id: this exercises the logical stem shared by
+        // `fallback.jsonl` and `fallback.jsonl.zst`.
+        let fallback = concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            "\n"
+        );
+        let timestamped = concat!(
+            r#"{"type":"session_meta","payload":{"id":"logical-timestamped"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-10-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"output_tokens":1}}}}"#,
+            "\n"
+        );
+        for (name, contents) in [("fallback", fallback), ("timestamped", timestamped)] {
+            std::fs::write(sessions.join(format!("{name}.jsonl")), contents).unwrap();
+            std::fs::write(
+                sessions.join(format!("{name}.jsonl.zst")),
+                zstd::encode_all(contents.as_bytes(), 0).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let clients = vec!["codex".to_string()];
+        let home = source_home.path().to_str().unwrap();
+        let assert_usage = |label: &str, messages: &[UnifiedMessage]| {
+            assert_eq!(messages.len(), 3, "{label}");
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.input)
+                    .sum::<i64>(),
+                27,
+                "{label}"
+            );
+            let keys = messages
+                .iter()
+                .map(|message| message.dedup_key.as_deref().unwrap())
+                .collect::<HashSet<_>>();
+            assert_eq!(keys.len(), 3, "{label}");
+            assert!(
+                keys.contains("codex:usage-fallback:8:fallback:0:5:gpt-5")
+                    && keys.contains("codex:usage-fallback:8:fallback:1:5:gpt-5"),
+                "plain and compressed stems must share distinct event keys ({label})"
+            );
+            assert!(
+                keys.contains("codex:token_count:1790812801000:openai:gpt-5:7:1:0:0:0"),
+                "the existing timestamp-derived key must remain byte-identical ({label})"
+            );
+        };
+
+        let cold = parse_all_messages_with_pricing(home, &clients, None);
+        assert_usage("cold cache", &cold);
+        let warm = parse_all_messages_with_pricing(home, &clients, None);
+        assert_usage("warm cache", &warm);
+
+        let direct = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.to_string()),
+            use_env_roots: false,
+            clients: Some(clients),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(direct.counts.get(ClientId::Codex), 3);
+        assert_eq!(
+            direct
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            27
+        );
+    }
+
+    #[test]
+    #[serial]
     fn missing_codex_usage_warning_tracks_cold_warm_append_rewrite_and_deletion() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();

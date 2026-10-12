@@ -372,6 +372,11 @@ pub(crate) struct CodexParseState {
     /// incremental re-parses.
     #[serde(default)]
     pub turn_id_announced_by_task_started: bool,
+    /// Number of native token-count and headless usage events already visited.
+    /// This is persisted so fallback-timestamp rows keep a stable ordinal when
+    /// a live rollout is parsed incrementally from a cached offset.
+    #[serde(default)]
+    pub usage_event_ordinal: u64,
     /// The turns this rollout has recorded usage for so far; see
     /// [`CodexTurnCoverage`]. `#[serde(default)]` keeps it across incremental
     /// re-parses, since a mirror row for an earlier turn still has to yield.
@@ -480,6 +485,12 @@ impl CodexParseState {
         self.has_own_synthetic_activity |= super::synthetic::is_synthetic_gateway(model, provider);
         self.has_own_activity = true;
     }
+
+    fn next_usage_event_ordinal(&mut self) -> u64 {
+        let ordinal = self.usage_event_ordinal;
+        self.usage_event_ordinal = self.usage_event_ordinal.saturating_add(1);
+        ordinal
+    }
 }
 
 fn codex_workspace_from_cwd(cwd: &str) -> (Option<String>, Option<String>) {
@@ -513,6 +524,19 @@ fn looks_like_explicit_workspace_path(path: &str) -> bool {
 
     let bytes = path.as_bytes();
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+}
+
+#[derive(Debug)]
+struct CodexFallbackDedupIdentity {
+    rollout_id: String,
+    usage_event_ordinal: u64,
+}
+
+#[derive(Debug)]
+struct PendingCodexMessage {
+    message: UnifiedMessage,
+    used_fallback_timestamp: bool,
+    fallback_dedup: Option<CodexFallbackDedupIdentity>,
 }
 
 fn parse_codex_reader<R: BufRead>(
@@ -596,6 +620,10 @@ fn parse_codex_reader<R: BufRead>(
                     None
                 };
                 let event_model = payload_model.clone().or(info_model.clone());
+                // Count every native token event, including ledger snapshots
+                // that accounting later skips. Its position in the logical
+                // rollout is stable across plain and compressed copies.
+                let usage_event_ordinal = is_token_count.then(|| state.next_usage_event_ordinal());
 
                 // The turn the following token_count rows belong to. Both
                 // `task_started` and `turn_context` start a turn, so each
@@ -1044,7 +1072,7 @@ fn parse_codex_reader<R: BufRead>(
                         message.is_turn_start = true;
                         state.pending_turn_start = false;
                     }
-                    if parsed_timestamp.is_some() || total_usage.is_some() {
+                    let fallback_dedup = if parsed_timestamp.is_some() || total_usage.is_some() {
                         // Fork/subagent children replay the same upstream
                         // token_count history into many sibling files. Those
                         // replays carry identical cumulative totals but a
@@ -1064,7 +1092,30 @@ fn parse_codex_reader<R: BufRead>(
                             dedup_scope_id,
                             total_usage,
                         );
-                    }
+                        None
+                    } else {
+                        // A timestamp-less, last-only row used to have no key,
+                        // so a live rollout and its `.jsonl.zst` copy were both
+                        // counted. The logical rollout plus event ordinal stays
+                        // stable even though each copy has a different mtime.
+                        // This only stabilizes identity: after the plain file is
+                        // removed, the archive can still move the row's day to
+                        // its newer mtime because the original mtime is absent.
+                        let identity = CodexFallbackDedupIdentity {
+                            rollout_id: state
+                                .session_id_from_meta
+                                .as_deref()
+                                .filter(|id| !id.is_empty())
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| session_id.to_string()),
+                            usage_event_ordinal: usage_event_ordinal
+                                .expect("a token_count has an event ordinal"),
+                        };
+                        if let Some(model) = model.as_deref() {
+                            set_codex_fallback_dedup_key(&mut message, model, &identity);
+                        }
+                        Some(identity)
+                    };
                     message.set_workspace(
                         state.session_workspace_key.clone(),
                         state.session_workspace_label.clone(),
@@ -1083,7 +1134,11 @@ fn parse_codex_reader<R: BufRead>(
                             fallback_timestamp_indices.push(messages.len() - 1);
                         }
                     } else {
-                        pending_model_messages.push((message, parsed_timestamp.is_none()));
+                        pending_model_messages.push(PendingCodexMessage {
+                            message,
+                            used_fallback_timestamp: parsed_timestamp.is_none(),
+                            fallback_dedup,
+                        });
                     }
                     handled = true;
                 }
@@ -1373,14 +1428,38 @@ fn set_codex_dedup_key(
     }
 }
 
+fn set_codex_fallback_dedup_key(
+    message: &mut UnifiedMessage,
+    model: &str,
+    identity: &CodexFallbackDedupIdentity,
+) {
+    if message.dedup_key.is_none() {
+        message.dedup_key = Some(format!(
+            "codex:usage-fallback:{}:{}:{}:{}:{}",
+            identity.rollout_id.len(),
+            identity.rollout_id,
+            identity.usage_event_ordinal,
+            model.len(),
+            model
+        ));
+    }
+}
+
 fn flush_pending_model_messages(
-    pending_model_messages: &mut Vec<(UnifiedMessage, bool)>,
+    pending_model_messages: &mut Vec<PendingCodexMessage>,
     messages: &mut Vec<UnifiedMessage>,
     fallback_timestamp_indices: &mut Vec<usize>,
     model: &str,
 ) {
-    for (mut message, used_fallback_timestamp) in pending_model_messages.drain(..) {
-        if !used_fallback_timestamp {
+    for pending in pending_model_messages.drain(..) {
+        let PendingCodexMessage {
+            mut message,
+            used_fallback_timestamp,
+            fallback_dedup,
+        } = pending;
+        if let Some(identity) = fallback_dedup.as_ref() {
+            set_codex_fallback_dedup_key(&mut message, model, identity);
+        } else if !used_fallback_timestamp {
             let upstream_session_id = message.session_id.clone();
             set_codex_dedup_key(&mut message, model, &upstream_session_id, None);
         }
@@ -1393,7 +1472,7 @@ fn flush_pending_model_messages(
 }
 
 fn flush_pending_model_messages_as_unknown(
-    pending_model_messages: &mut Vec<(UnifiedMessage, bool)>,
+    pending_model_messages: &mut Vec<PendingCodexMessage>,
     messages: &mut Vec<UnifiedMessage>,
     fallback_timestamp_indices: &mut Vec<usize>,
     unresolved_model_events: &mut bool,
@@ -1649,6 +1728,7 @@ fn parse_codex_headless_line(
     }
 
     let usage = extract_headless_usage(&value)?;
+    let usage_event_ordinal = state.next_usage_event_ordinal();
     state.has_supported_usage |= usage.has_supported_counters;
     let model = usage
         .model
@@ -1671,26 +1751,38 @@ fn parse_codex_headless_line(
         state.session_agent.clone()
     };
 
-    Some((
-        UnifiedMessage::new_with_agent(
-            "codex",
-            model,
-            provider,
-            session_id.to_string(),
-            timestamp,
-            TokenBreakdown {
-                input: usage.input.max(0),
-                output: usage.output.max(0),
-                cache_read: usage.cached.max(0),
-                cache_write: 0,
-                cache_write_1h: 0,
-                reasoning: 0,
-            },
-            0.0,
-            agent,
-        ),
-        usage.timestamp_ms.is_none(),
-    ))
+    let used_fallback_timestamp = usage.timestamp_ms.is_none();
+    let mut message = UnifiedMessage::new_with_agent(
+        "codex",
+        model.clone(),
+        provider,
+        session_id.to_string(),
+        timestamp,
+        TokenBreakdown {
+            input: usage.input.max(0),
+            output: usage.output.max(0),
+            cache_read: usage.cached.max(0),
+            cache_write: 0,
+            cache_write_1h: 0,
+            reasoning: 0,
+        },
+        0.0,
+        agent,
+    );
+    if used_fallback_timestamp {
+        let identity = CodexFallbackDedupIdentity {
+            rollout_id: state
+                .session_id_from_meta
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| session_id.to_string()),
+            usage_event_ordinal,
+        };
+        set_codex_fallback_dedup_key(&mut message, &model, &identity);
+    }
+
+    Some((message, used_fallback_timestamp))
 }
 
 fn extract_headless_usage(value: &Value) -> Option<CodexHeadlessUsage> {
@@ -4222,6 +4314,103 @@ mod tests {
     }
 
     #[test]
+    fn fallback_usage_dedup_keys_are_copy_stable_and_event_specific() {
+        let dir = TempDir::new().unwrap();
+        let content = concat!(
+            r#"{"type":"session_meta","payload":{"id":"logical-rollout"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            "\n",
+            r#"{"type":"metadata","model":"gpt-5"}"#,
+            "\n"
+        );
+        let plain_path = dir.path().join("fallback.jsonl");
+        let zst_path = dir.path().join("fallback.jsonl.zst");
+        std::fs::write(&plain_path, content).unwrap();
+        std::fs::write(&zst_path, zstd::encode_all(content.as_bytes(), 0).unwrap()).unwrap();
+
+        let plain = parse_codex_file(&plain_path);
+        let compressed = parse_codex_file(&zst_path);
+        let plain_keys = plain
+            .iter()
+            .map(|message| message.dedup_key.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        let compressed_keys = compressed
+            .iter()
+            .map(|message| message.dedup_key.as_deref().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(plain.len(), 2);
+        assert_eq!(compressed_keys, plain_keys);
+        assert_eq!(
+            plain_keys,
+            vec![
+                "codex:usage-fallback:15:logical-rollout:0:5:gpt-5",
+                "codex:usage-fallback:15:logical-rollout:1:5:gpt-5",
+            ]
+        );
+    }
+
+    #[test]
+    fn fallback_usage_ordinal_survives_incremental_resume() {
+        let event = concat!(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            "\n"
+        );
+        let mut file = create_test_file(&format!(
+            "{}\n{}\n{event}",
+            r#"{"type":"session_meta","payload":{"id":"incremental-rollout"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        ));
+        let initial = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(initial.messages.len(), 1);
+        assert_eq!(initial.state.usage_event_ordinal, 1);
+        assert_eq!(
+            initial.messages[0].dedup_key.as_deref(),
+            Some("codex:usage-fallback:19:incremental-rollout:0:5:gpt-5")
+        );
+
+        file.as_file_mut().write_all(event.as_bytes()).unwrap();
+        file.as_file_mut().flush().unwrap();
+        let appended =
+            parse_codex_file_incremental(file.path(), initial.consumed_offset, initial.state);
+
+        assert_eq!(appended.messages.len(), 1);
+        assert_eq!(appended.state.usage_event_ordinal, 2);
+        assert_eq!(
+            appended.messages[0].dedup_key.as_deref(),
+            Some("codex:usage-fallback:19:incremental-rollout:1:5:gpt-5")
+        );
+    }
+
+    #[test]
+    fn headless_fallback_usage_gets_the_same_copy_stable_identity() {
+        let dir = TempDir::new().unwrap();
+        let content = concat!(
+            r#"{"type":"session_meta","payload":{"id":"headless-rollout"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","model":"gpt-4o","usage":{"input_tokens":12,"output_tokens":3}}"#,
+            "\n"
+        );
+        let plain_path = dir.path().join("headless.jsonl");
+        let zst_path = dir.path().join("headless.jsonl.zst");
+        std::fs::write(&plain_path, content).unwrap();
+        std::fs::write(&zst_path, zstd::encode_all(content.as_bytes(), 0).unwrap()).unwrap();
+
+        let plain = parse_codex_file(&plain_path);
+        let compressed = parse_codex_file(&zst_path);
+
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].dedup_key, compressed[0].dedup_key);
+        assert_eq!(
+            plain[0].dedup_key.as_deref(),
+            Some("codex:usage-fallback:16:headless-rollout:0:6:gpt-4o")
+        );
+    }
+
+    #[test]
     fn compressed_archives_preserve_codex_usage_and_session_identity() {
         let dir = TempDir::new().unwrap();
         let content = concat!(
@@ -4241,6 +4430,11 @@ mod tests {
         assert_eq!(expected[0].tokens.output, 10);
         assert_eq!(expected[0].tokens.reasoning, 10);
         assert_eq!(expected[0].tokens.total(), 160);
+        assert_eq!(
+            expected[0].dedup_key.as_deref(),
+            Some("codex:token_count-total:fixture:openai:gpt-5:140:20:30:10"),
+            "the normal timestamped fixture's existing key must not change"
+        );
 
         let zst_path = dir.path().join("fixture.jsonl.zst");
         std::fs::write(&zst_path, zstd::encode_all(content.as_bytes(), 0).unwrap()).unwrap();
