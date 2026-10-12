@@ -127,10 +127,36 @@ const USAGE_SUMMARY_ENDPOINT: &str = "https://cursor.com/api/usage-summary";
 /// `totalUsageEventsCount` events (or a page comes back short/empty).
 const CURSOR_JSON_PAGE_SIZE: usize = 500;
 
-/// Hard ceiling on pages walked in one fetch, so a server that keeps returning
-/// full pages (or a mis-reported total) can't spin forever. At the page size
-/// above this admits up to a quarter-million events.
+/// Page ceiling for one fetch at the requested page size, so a server that
+/// keeps returning full pages (or a mis-reported total) can't spin forever.
+/// At the page size above this admits up to a quarter-million events.
 const CURSOR_MAX_JSON_PAGES: usize = 500;
+
+/// The event budget behind [`CURSOR_MAX_JSON_PAGES`]. When Cursor clamps the
+/// requested page size (it has been seen returning 100 rows for a 500-row
+/// request), a fixed page ceiling would quietly shrink this budget fivefold and
+/// fail every history above ~50,000 events, so the page ceiling is derived from
+/// the page size the server actually honours instead.
+const CURSOR_MAX_JSON_EVENTS: usize = CURSOR_JSON_PAGE_SIZE * CURSOR_MAX_JSON_PAGES;
+
+/// Smallest page yield the derived ceiling is sized for, which bounds the
+/// walk at `CURSOR_MAX_JSON_EVENTS / 50` = 5,000 pages however hard a server
+/// clamps. The byte cap and the time budget still bound the walk as well.
+const CURSOR_MIN_PAGE_YIELD_FOR_LIMIT: usize = 50;
+
+/// How many pages one fetch may walk, given the largest page the server has
+/// returned so far. Pages are full except the last, so the largest page seen
+/// is the page size the server honours. The result never drops below
+/// [`CURSOR_MAX_JSON_PAGES`].
+fn cursor_page_limit(largest_page_yield: usize) -> usize {
+    if largest_page_yield == 0 {
+        return CURSOR_MAX_JSON_PAGES;
+    }
+    let honoured = largest_page_yield.max(CURSOR_MIN_PAGE_YIELD_FOR_LIMIT);
+    CURSOR_MAX_JSON_EVENTS
+        .div_ceil(honoured)
+        .max(CURSOR_MAX_JSON_PAGES)
+}
 
 /// Cumulative ceiling on the usage-events JSON downloaded in one fetch, enforced
 /// *while* each page is read rather than after it has all arrived, and counted
@@ -1241,7 +1267,11 @@ async fn fetch_cursor_usage_events_json_from(
     let mut fetch_deadline = deadline_after(start_time, overall_budget);
 
     let mut completed = false;
-    for page in 1..=CURSOR_MAX_JSON_PAGES {
+    let mut page_limit = CURSOR_MAX_JSON_PAGES;
+    let mut largest_page_yield = 0usize;
+    let mut page = 0usize;
+    while page < page_limit {
+        page += 1;
         let remaining_budget = fetch_deadline.saturating_duration_since(Instant::now());
         if remaining_budget.is_zero() {
             let budget_secs = overall_budget.as_secs();
@@ -1372,6 +1402,8 @@ async fn fetch_cursor_usage_events_json_from(
         };
         let received = page_events.len();
         all_events.extend(page_events);
+        largest_page_yield = largest_page_yield.max(received);
+        page_limit = cursor_page_limit(largest_page_yield);
 
         // When running an explicit sync with the default budget (no custom
         // override specified via flag or environment variable), dynamically
@@ -1421,7 +1453,8 @@ async fn fetch_cursor_usage_events_json_from(
     // was collected; caching it would masquerade as a full sync, so fail instead.
     if !completed {
         anyhow::bail!(
-            "Cursor usage events exceeded the {CURSOR_MAX_JSON_PAGES}-page fetch limit before the full history was collected; refusing to cache a partial history"
+            "Cursor usage events exceeded the {page_limit}-page fetch limit ({} events collected) before the full history was collected; refusing to cache a partial history",
+            all_events.len()
         );
     }
 
@@ -2652,6 +2685,27 @@ mod tests {
         assert!(captured[0].contains("\"page\":1"));
         assert!(captured[1].contains("\"page\":2"));
         assert!(captured[2].contains("\"page\":3"));
+    }
+
+    #[test]
+    fn test_cursor_page_limit_follows_the_page_size_the_server_honours() {
+        // Nothing observed yet, or the requested size honoured: today's ceiling.
+        assert_eq!(cursor_page_limit(0), CURSOR_MAX_JSON_PAGES);
+        assert_eq!(
+            cursor_page_limit(CURSOR_JSON_PAGE_SIZE),
+            CURSOR_MAX_JSON_PAGES
+        );
+        // Cursor clamping 500 -> 100 keeps the same 250,000-event budget.
+        assert_eq!(cursor_page_limit(100), 2_500);
+        assert_eq!(cursor_page_limit(100) * 100, CURSOR_MAX_JSON_EVENTS);
+        // Harder clamps are bounded by the minimum-yield floor.
+        assert_eq!(cursor_page_limit(1), 5_000);
+        assert_eq!(cursor_page_limit(49), 5_000);
+        // Oversized pages never lower the ceiling below today's.
+        assert_eq!(cursor_page_limit(1_000), CURSOR_MAX_JSON_PAGES);
+        assert_eq!(cursor_page_limit(usize::MAX), CURSOR_MAX_JSON_PAGES);
+        // A 60,000-event history clamped to 100 per page now fits.
+        assert!(cursor_page_limit(100) >= 600);
     }
 
     #[test]
