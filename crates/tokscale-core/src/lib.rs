@@ -5593,7 +5593,10 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         .filter(|(key, _)| key.is_empty() || seen_keys.insert(key.clone()))
         .map(|(_, msg)| msg)
         .collect();
-    let claude_count = claude_msgs.len() as i32;
+    // Advisor rows (#1398) carry `message_count = 0`: they add tokens and cost
+    // to the parent reply rather than a reply of their own, so the client's
+    // message count sums `message_count` like the reports do, not row count.
+    let claude_count = summed_parsed_message_count(&claude_msgs);
     counts.set(ClientId::Claude, claude_count);
     messages.extend(claude_msgs);
 
@@ -10918,6 +10921,47 @@ mod tests {
             assert_eq!(parsed.messages[0].input, 100);
             assert_eq!(parsed.messages[0].output, 20);
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_counts_claude_advisor_rows_as_part_of_the_reply() {
+        // One assistant reply that consulted an advisor model yields two rows
+        // (the reply and its advisor call) but is still one Claude message.
+        let source_home = tempfile::TempDir::new().unwrap();
+        let project = source_home.path().join(".claude/projects/repro");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("live.jsonl"),
+            r#"{"type":"assistant","timestamp":"2026-10-02T20:10:51.000Z","requestId":"req_adv","message":{"id":"msg_adv","model":"claude-opus-5-5","usage":{"input_tokens":4,"output_tokens":779,"iterations":[{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":114995,"output_tokens":2343}]}}}"#,
+        )
+        .unwrap();
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["claude".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+
+        assert_eq!(parsed.messages.len(), 2, "reply row plus advisor row");
+        assert_eq!(
+            parsed.counts.get(ClientId::Claude),
+            1,
+            "an advisor call is not a second Claude message"
+        );
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .map(|message| message.message_count)
+                .sum::<i32>(),
+            1
+        );
     }
 
     #[test]
