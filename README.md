@@ -71,7 +71,7 @@
 | <img width="48px" src=".github/assets/client-droid.png" alt="Droid" /> | [Droid (Factory Droid)](https://factory.ai/) | `~/.factory/sessions/` |
 | <img width="48px" src=".github/assets/client-pi.png" alt="Pi" /> | [Pi](https://github.com/badlogic/pi-mono) | `~/.pi/agent/sessions/` |
 | <img width="48px" src="https://omp.sh/favicon-180x180.png" alt="Oh My Pi" /> | [omp (Oh My Pi)](https://github.com/can1357/oh-my-pi) | `~/.omp/agent/sessions/**/*.jsonl` |
-| <img width="48px" src=".github/assets/client-senpi.png" alt="Senpi" /> | [Senpi (OmO Native)](https://github.com/code-yeongyu/senpi) | `~/.senpi/agent/sessions/` (override via `SENPI_CODING_AGENT_DIR`) |
+| <img width="48px" src=".github/assets/client-senpi.png" alt="Senpi" /> | [Senpi (OmO Native)](https://github.com/code-yeongyu/senpi) | `~/.senpi/agent/sessions/` (override via `SENPI_CODING_AGENT_DIR`) and `~/.omo/agent/sessions/` (OmO Native, omo-ai 5.1.0+), plus each project's task children in `.omo/senpi-task/children/`; add other OmO locations with `scanner.extraScanPaths.senpi` |
 | <img width="48px" src="https://github.com/getkimchi.png" alt="Kimchi" /> | [Kimchi Coding](https://kimchi.dev/) | `~/.config/kimchi/harness/sessions/` (override via `KIMCHI_CODING_AGENT_DIR`) |
 | <img width="48px" src=".github/assets/client-synthetic.png" alt="Reasonix" /> | [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) | `~/.reasonix/stats/*.jsonl` (override via `REASONIX_STATE_HOME` or `REASONIX_HOME`) |
 | <img width="48px" src=".github/assets/client-kimi.png" alt="Kimi" /> | [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) / [Kimi Code](https://github.com/MoonshotAI/kimi-code) | kimi-cli: `~/.kimi/sessions/` kimi-code: `~/.kimi-code/sessions/` (override via `KIMI_CODE_HOME`) kimi-work: desktop app-data root (auto-discovered) |
@@ -996,7 +996,7 @@ Existing installs are unaffected until they pin, and the run that pins reports
 exactly what it would have reported anyway: the zone recorded is the one the
 machine was already using.
 
-Use `scanner.extraScanPaths` for persistent extra roots such as project-level `.codex` directories or imported Gemini/OpenClaw histories. Tokscale automatically discovers Hermes profile databases under `$HERMES_HOME/profiles/*/state.db` (or `~/.hermes/profiles/*/state.db` when `HERMES_HOME` is unset). Use `scanner.extraScanPaths.hermes` only for non-standard Hermes profile locations; entries may point at a profile directory containing `state.db` or directly at a `state.db` file. Tokscale merges these paths with the default scan roots on every run and deduplicates overlapping roots by canonical path.
+Use `scanner.extraScanPaths` for persistent extra roots such as project-level `.codex` directories or imported Gemini/OpenClaw histories. Tokscale automatically discovers Hermes profile databases under `$HERMES_HOME/profiles/*/state.db` (or `~/.hermes/profiles/*/state.db` when `HERMES_HOME` is unset). Use `scanner.extraScanPaths.hermes` only for non-standard Hermes profile locations; entries may point at a profile directory containing `state.db` or directly at a `state.db` file. For an OmO Native agent directory outside `~/.omo/agent`, add it to `scanner.extraScanPaths.senpi`; the entry may point at the agent directory or its `sessions/` directory (see [Senpi (OmO Native)](#senpi-omo-native)). Tokscale merges these paths with the default scan roots on every run and deduplicates overlapping roots by canonical path.
 
 Use `defaultClients` to pin a personal default — for example, set it to `["opencode", "claude"]` if those are the only clients you use, and `tokscale` (with no flags) will scope every report to them automatically. Pass `--client` on the command line to override for a single run.
 
@@ -1875,6 +1875,24 @@ JSONL format with session header and message entries:
 ```json
 {"type":"session","id":"pi_ses_001","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
 {"type":"message","id":"msg_001","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input":100,"output":50,"cacheRead":10,"cacheWrite":5,"totalTokens":165}}}
+```
+
+### Senpi (OmO Native)
+
+Location: `~/.senpi/agent/sessions/<encoded-cwd>/*.jsonl` and `~/.omo/agent/sessions/<encoded-cwd>/*.jsonl` (OmO Native, omo-ai 5.1.0+), plus task child sessions under each project's `.omo/senpi-task/children/`
+
+Senpi uses the same JSONL session format as Pi. OmO stores task child sessions inside each project, so Tokscale reads the `cwd` from the session headers in both sessions trees and scans `<project>/.omo/senpi-task/children/` for every project that has one. If OmO's `task.state_dir` is set to an absolute path (in the project's `.omo/omo.jsonc` or `.omo/omo.json`, or in the same file under `~/.omo/`), Tokscale scans `<state_dir>/children/` instead.
+
+If OmO keeps its agent directory somewhere else, add it to `scanner.extraScanPaths.senpi` in `~/.config/tokscale/settings.json`. The entry may point at the agent directory or at its `sessions/` directory. Tokscale scans the sessions there and finds the task children of the projects they record in the same way:
+
+```json
+{
+  "scanner": {
+    "extraScanPaths": {
+      "senpi": ["/Users/me/custom/omo/agent"]
+    }
+  }
+}
 ```
 
 ### Prime Agent

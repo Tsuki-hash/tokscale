@@ -71,7 +71,7 @@
 | <img width="48px" src=".github/assets/client-droid.png" alt="Droid" /> | [Droid (Factory Droid)](https://factory.ai/) | `~/.factory/sessions/` |
 | <img width="48px" src=".github/assets/client-pi.png" alt="Pi" /> | [Pi](https://github.com/badlogic/pi-mono) | `~/.pi/agent/sessions/` |
 | <img width="48px" src="https://omp.sh/favicon-180x180.png" alt="Oh My Pi" /> | [omp (Oh My Pi)](https://github.com/can1357/oh-my-pi) | `~/.omp/agent/sessions/**/*.jsonl` |
-| <img width="48px" src=".github/assets/client-senpi.png" alt="Senpi" /> | [Senpi (OmO Native)](https://github.com/code-yeongyu/senpi) | `~/.senpi/agent/sessions/` (`SENPI_CODING_AGENT_DIR` でオーバーライド可能) |
+| <img width="48px" src=".github/assets/client-senpi.png" alt="Senpi" /> | [Senpi (OmO Native)](https://github.com/code-yeongyu/senpi) | `~/.senpi/agent/sessions/` (`SENPI_CODING_AGENT_DIR` でオーバーライド可能) および `~/.omo/agent/sessions/`（OmO Native、omo-ai 5.1.0+）、さらに各プロジェクトの `.omo/senpi-task/children/` にあるタスク子セッション。その他の OmO の場所は `scanner.extraScanPaths.senpi` で追加 |
 | <img width="48px" src="https://github.com/getkimchi.png" alt="Kimchi" /> | [Kimchi Coding](https://kimchi.dev/) | `~/.config/kimchi/harness/sessions/`（`KIMCHI_CODING_AGENT_DIR` でオーバーライド可能） |
 | <img width="48px" src=".github/assets/client-synthetic.png" alt="Reasonix" /> | [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) | `~/.reasonix/stats/*.jsonl`（`REASONIX_STATE_HOME` または `REASONIX_HOME` でオーバーライド可能） |
 | <img width="48px" src=".github/assets/client-kimi.png" alt="Kimi" /> | [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) / [Kimi Code](https://github.com/MoonshotAI/kimi-code) | kimi-cli: `~/.kimi/sessions/` kimi-code: `~/.kimi-code/sessions/` (`KIMI_CODE_HOME` でオーバーライド可能) kimi-work: デスクトップ app-data ルート（自動検出） |
@@ -969,7 +969,7 @@ $ tokscale config set timezone auto
 
 既存のインストールは、タイムゾーンを固定するまで影響を受けません。また、固定する実行では元からマシンが使用していたタイムゾーンが記録されるため、その実行のレポート内容は従来どおりです。
 
-プロジェクトレベルの `.codex` ディレクトリや、インポートした Gemini/OpenClaw 履歴など、恒久的な追加ルートには `scanner.extraScanPaths` を使用してください。Tokscale は `$HERMES_HOME/profiles/*/state.db` 以下の Hermes プロファイルデータベースを自動的に検出します（`HERMES_HOME` が未設定の場合は `~/.hermes/profiles/*/state.db`）。標準外の Hermes プロファイル場所にのみ `scanner.extraScanPaths.hermes` を使用してください。Hermes のエントリは `state.db` を含むプロファイルディレクトリ、または `state.db` ファイルを直接指すことができます。Tokscale はこれらのパスを毎回デフォルトのスキャンルートとマージし、重複するルートを正規パスで重複排除します。
+プロジェクトレベルの `.codex` ディレクトリや、インポートした Gemini/OpenClaw 履歴など、恒久的な追加ルートには `scanner.extraScanPaths` を使用してください。Tokscale は `$HERMES_HOME/profiles/*/state.db` 以下の Hermes プロファイルデータベースを自動的に検出します（`HERMES_HOME` が未設定の場合は `~/.hermes/profiles/*/state.db`）。標準外の Hermes プロファイル場所にのみ `scanner.extraScanPaths.hermes` を使用してください。Hermes のエントリは `state.db` を含むプロファイルディレクトリ、または `state.db` ファイルを直接指すことができます。`~/.omo/agent` 以外にある OmO Native のエージェントディレクトリは `scanner.extraScanPaths.senpi` に追加してください。エントリはエージェントディレクトリ、またはその `sessions/` ディレクトリを指すことができます（[Senpi (OmO Native)](#senpi-omo-native) を参照）。Tokscale はこれらのパスを毎回デフォルトのスキャンルートとマージし、重複するルートを正規パスで重複排除します。
 
 #### Minutely タブの有効化
 
@@ -1785,6 +1785,24 @@ HermesはSQLiteの`sessions`テーブルにセッションレベルの使用量�
 ```json
 {"type":"session","id":"pi_ses_001","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
 {"type":"message","id":"msg_001","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input":100,"output":50,"cacheRead":10,"cacheWrite":5,"totalTokens":165}}}
+```
+
+### Senpi (OmO Native)
+
+場所: `~/.senpi/agent/sessions/<encoded-cwd>/*.jsonl` および `~/.omo/agent/sessions/<encoded-cwd>/*.jsonl`（OmO Native、omo-ai 5.1.0+）、さらに各プロジェクトの `.omo/senpi-task/children/` 配下のタスク子セッション
+
+Senpi は Pi と同じ JSONL セッション形式を使います。OmO はタスク子セッションを各プロジェクト内に保存するため、Tokscale は両方のセッションツリーにあるセッションヘッダーから `cwd` を読み取り、`<project>/.omo/senpi-task/children/` があるすべてのプロジェクトでそのディレクトリをスキャンします。OmO の `task.state_dir` が絶対パスで設定されている場合（プロジェクトの `.omo/omo.jsonc` または `.omo/omo.json`、あるいは `~/.omo/` 配下の同じファイル）は、代わりに `<state_dir>/children/` をスキャンします。
+
+OmO のエージェントディレクトリが別の場所にある場合は、`~/.config/tokscale/settings.json` の `scanner.extraScanPaths.senpi` に追加してください。エントリはエージェントディレクトリ、またはその `sessions/` ディレクトリを指すことができます。Tokscale はそこにあるセッションをスキャンし、セッションに記録されたプロジェクトのタスク子セッションも同じ方法で見つけます：
+
+```json
+{
+  "scanner": {
+    "extraScanPaths": {
+      "senpi": ["/Users/me/custom/omo/agent"]
+    }
+  }
+}
 ```
 
 ### Prime Agent

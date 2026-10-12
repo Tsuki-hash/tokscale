@@ -72,7 +72,7 @@
 | <img width="48px" src=".github/assets/client-droid.png" alt="Droid" /> | [Droid (Factory Droid)](https://factory.ai/) | `~/.factory/sessions/` |
 | <img width="48px" src=".github/assets/client-pi.png" alt="Pi" /> | [Pi](https://github.com/badlogic/pi-mono) | `~/.pi/agent/sessions/` |
 | <img width="48px" src="https://omp.sh/favicon-180x180.png" alt="Oh My Pi" /> | [omp (Oh My Pi)](https://github.com/can1357/oh-my-pi) | `~/.omp/agent/sessions/**/*.jsonl` |
-| <img width="48px" src=".github/assets/client-senpi.png" alt="Senpi" /> | [Senpi (OmO Native)](https://github.com/code-yeongyu/senpi) | `~/.senpi/agent/sessions/`（通过 `SENPI_CODING_AGENT_DIR` 覆盖） |
+| <img width="48px" src=".github/assets/client-senpi.png" alt="Senpi" /> | [Senpi (OmO Native)](https://github.com/code-yeongyu/senpi) | `~/.senpi/agent/sessions/`（通过 `SENPI_CODING_AGENT_DIR` 覆盖）和 `~/.omo/agent/sessions/`（OmO Native，omo-ai 5.1.0+），以及各项目 `.omo/senpi-task/children/` 下的任务子会话；其他 OmO 位置可通过 `scanner.extraScanPaths.senpi` 添加 |
 | <img width="48px" src="https://github.com/getkimchi.png" alt="Kimchi" /> | [Kimchi Coding](https://kimchi.dev/) | `~/.config/kimchi/harness/sessions/`（可通过 `KIMCHI_CODING_AGENT_DIR` 覆盖） |
 | <img width="48px" src=".github/assets/client-synthetic.png" alt="Reasonix" /> | [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) | `~/.reasonix/stats/*.jsonl`（可通过 `REASONIX_STATE_HOME` 或 `REASONIX_HOME` 覆盖） |
 | <img width="48px" src=".github/assets/client-kimi.png" alt="Kimi" /> | [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) / [Kimi Code](https://github.com/MoonshotAI/kimi-code) | kimi-cli: `~/.kimi/sessions/` kimi-code: `~/.kimi-code/sessions/`（可通过 `KIMI_CODE_HOME` 覆盖）kimi-work：桌面端 app-data 根目录（自动发现） |
@@ -969,7 +969,7 @@ $ tokscale config set timezone auto
 
 现有安装在首次建立固定值之前不会受到影响。记录的时区等于该设备当前机器时区，因此首次固定操作不会重新分桶现有历史记录。
 
-使用 `scanner.extraScanPaths` 配置持久化的额外根目录，例如项目级的 `.codex` 目录或导入的 Gemini/OpenClaw 历史。Tokscale 会自动发现 `$HERMES_HOME/profiles/*/state.db` 下的 Hermes 配置文件数据库（未设置 `HERMES_HOME` 时为 `~/.hermes/profiles/*/state.db`）。仅对非标准的 Hermes 配置文件位置使用 `scanner.extraScanPaths.hermes`；Hermes 条目既可以指向包含 `state.db` 的配置文件目录，也可以直接指向 `state.db` 文件。Tokscale 在每次运行时都会将这些路径与默认扫描根目录合并，并按规范路径去重重叠的根目录。
+使用 `scanner.extraScanPaths` 配置持久化的额外根目录，例如项目级的 `.codex` 目录或导入的 Gemini/OpenClaw 历史。Tokscale 会自动发现 `$HERMES_HOME/profiles/*/state.db` 下的 Hermes 配置文件数据库（未设置 `HERMES_HOME` 时为 `~/.hermes/profiles/*/state.db`）。仅对非标准的 Hermes 配置文件位置使用 `scanner.extraScanPaths.hermes`；Hermes 条目既可以指向包含 `state.db` 的配置文件目录，也可以直接指向 `state.db` 文件。位于 `~/.omo/agent` 之外的 OmO Native agent 目录，请添加到 `scanner.extraScanPaths.senpi`；条目可以指向 agent 目录或其 `sessions/` 目录（参见 [Senpi (OmO Native)](#senpi-omo-native)）。Tokscale 在每次运行时都会将这些路径与默认扫描根目录合并，并按规范路径去重重叠的根目录。
 
 使用 `defaultClients` 固定一个个人默认值 —— 例如，如果您只使用 OpenCode 和 Claude，就将其设为 `["opencode", "claude"]`，那么 `tokscale`（不带任何选项）会自动将每个报告的范围限定为它们。在命令行传入 `--client` 可针对单次运行进行覆盖。
 
@@ -1822,6 +1822,24 @@ Hermes 将会话级使用量存储在 SQLite `sessions` 表中。Tokscale 导入
 ```json
 {"type":"session","id":"pi_ses_001","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
 {"type":"message","id":"msg_001","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input":100,"output":50,"cacheRead":10,"cacheWrite":5,"totalTokens":165}}}
+```
+
+### Senpi (OmO Native)
+
+位置：`~/.senpi/agent/sessions/<encoded-cwd>/*.jsonl` 和 `~/.omo/agent/sessions/<encoded-cwd>/*.jsonl`（OmO Native，omo-ai 5.1.0+），以及各项目 `.omo/senpi-task/children/` 下的任务子会话
+
+Senpi 使用与 Pi 相同的 JSONL 会话格式。OmO 将任务子会话保存在各个项目内部，因此 Tokscale 会从两个会话目录树的会话头中读取 `cwd`，并对每个存在 `<project>/.omo/senpi-task/children/` 的项目扫描该目录。如果 OmO 的 `task.state_dir` 被设置为绝对路径（位于项目的 `.omo/omo.jsonc` 或 `.omo/omo.json`，或 `~/.omo/` 下的同名文件），Tokscale 会改为扫描 `<state_dir>/children/`。
+
+如果 OmO 的 agent 目录位于其他位置，请将其添加到 `~/.config/tokscale/settings.json` 的 `scanner.extraScanPaths.senpi` 中。条目可以指向 agent 目录或其 `sessions/` 目录。Tokscale 会扫描其中的会话，并以同样的方式找到这些会话所记录项目的任务子会话：
+
+```json
+{
+  "scanner": {
+    "extraScanPaths": {
+      "senpi": ["/Users/me/custom/omo/agent"]
+    }
+  }
+}
 ```
 
 ### Prime Agent

@@ -71,7 +71,7 @@
 | <img width="48px" src=".github/assets/client-droid.png" alt="Droid" /> | [Droid (Factory Droid)](https://factory.ai/) | `~/.factory/sessions/` |
 | <img width="48px" src=".github/assets/client-pi.png" alt="Pi" /> | [Pi](https://github.com/badlogic/pi-mono) | `~/.pi/agent/sessions/` |
 | <img width="48px" src="https://omp.sh/favicon-180x180.png" alt="Oh My Pi" /> | [omp (Oh My Pi)](https://github.com/can1357/oh-my-pi) | `~/.omp/agent/sessions/**/*.jsonl` |
-| <img width="48px" src=".github/assets/client-senpi.png" alt="Senpi" /> | [Senpi (OmO Native)](https://github.com/code-yeongyu/senpi) | `~/.senpi/agent/sessions/` (`SENPI_CODING_AGENT_DIR`로 오버라이드 가능) |
+| <img width="48px" src=".github/assets/client-senpi.png" alt="Senpi" /> | [Senpi (OmO Native)](https://github.com/code-yeongyu/senpi) | `~/.senpi/agent/sessions/` (`SENPI_CODING_AGENT_DIR`로 오버라이드 가능) 및 `~/.omo/agent/sessions/` (OmO Native, omo-ai 5.1.0+), 그리고 각 프로젝트의 `.omo/senpi-task/children/`에 있는 태스크 하위 세션; 다른 OmO 위치는 `scanner.extraScanPaths.senpi`로 추가 |
 | <img width="48px" src="https://github.com/getkimchi.png" alt="Kimchi" /> | [Kimchi Coding](https://kimchi.dev/) | `~/.config/kimchi/harness/sessions/` (`KIMCHI_CODING_AGENT_DIR`로 오버라이드 가능) |
 | <img width="48px" src=".github/assets/client-synthetic.png" alt="Reasonix" /> | [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) | `~/.reasonix/stats/*.jsonl` (`REASONIX_STATE_HOME` 또는 `REASONIX_HOME`으로 오버라이드 가능) |
 | <img width="48px" src=".github/assets/client-kimi.png" alt="Kimi" /> | [Kimi CLI](https://github.com/MoonshotAI/kimi-cli) / [Kimi Code](https://github.com/MoonshotAI/kimi-code) | kimi-cli: `~/.kimi/sessions/` kimi-code: `~/.kimi-code/sessions/` (override via `KIMI_CODE_HOME`) kimi-work: desktop app-data root (auto-discovered) |
@@ -966,7 +966,7 @@ IANA 시간대 이름만 허용됩니다. `+09:00` 같은 고정 UTC 오프셋�
 
 기존 설치는 시간대를 고정할 때까지 영향을 받지 않습니다. 고정하는 실행은 이미 사용 중인 시간대를 기록하며, 이미 고정된 시간대가 있는 기기를 Tokscale이 자동으로 다시 고정하지 않습니다.
 
-`scanner.extraScanPaths`는 프로젝트 단위 `.codex` 디렉터리나 가져온 Gemini/OpenClaw 히스토리 같은 영구적인 추가 루트에 사용하세요. Tokscale은 `$HERMES_HOME/profiles/*/state.db` 아래의 Hermes 프로필 데이터베이스를 자동으로 발견합니다(`HERMES_HOME`이 없으면 `~/.hermes/profiles/*/state.db`). 비표준 Hermes 프로필 위치에만 `scanner.extraScanPaths.hermes`를 사용하세요. Hermes 항목은 `state.db`를 포함하는 프로필 디렉터리를 가리키거나 `state.db` 파일을 직접 가리킬 수 있습니다. Tokscale은 매 실행마다 이 경로들을 기본 스캔 루트와 병합하고, 겹치는 루트는 정규 경로(canonical path) 기준으로 중복 제거합니다.
+`scanner.extraScanPaths`는 프로젝트 단위 `.codex` 디렉터리나 가져온 Gemini/OpenClaw 히스토리 같은 영구적인 추가 루트에 사용하세요. Tokscale은 `$HERMES_HOME/profiles/*/state.db` 아래의 Hermes 프로필 데이터베이스를 자동으로 발견합니다(`HERMES_HOME`이 없으면 `~/.hermes/profiles/*/state.db`). 비표준 Hermes 프로필 위치에만 `scanner.extraScanPaths.hermes`를 사용하세요. Hermes 항목은 `state.db`를 포함하는 프로필 디렉터리를 가리키거나 `state.db` 파일을 직접 가리킬 수 있습니다. `~/.omo/agent` 밖에 있는 OmO Native 에이전트 디렉터리는 `scanner.extraScanPaths.senpi`에 추가하세요. 항목은 에이전트 디렉터리나 그 안의 `sessions/` 디렉터리를 가리킬 수 있습니다([Senpi (OmO Native)](#senpi-omo-native) 참조). Tokscale은 매 실행마다 이 경로들을 기본 스캔 루트와 병합하고, 겹치는 루트는 정규 경로(canonical path) 기준으로 중복 제거합니다.
 
 `defaultClients`로 개인 기본값을 고정할 수 있습니다 — 예를 들어 OpenCode와 Claude만 사용한다면 `["opencode", "claude"]`로 설정하면, `tokscale`(플래그 없이)은 모든 리포트를 자동으로 해당 클라이언트로 범위를 좁힙니다. 단일 실행에 대해 재정의하려면 명령줄에서 `--client`를 전달하세요.
 
@@ -1822,6 +1822,24 @@ Hermes는 세션 수준 사용량을 SQLite `sessions` 테이블에 저장합니
 ```json
 {"type":"session","id":"pi_ses_001","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
 {"type":"message","id":"msg_001","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input":100,"output":50,"cacheRead":10,"cacheWrite":5,"totalTokens":165}}}
+```
+
+### Senpi (OmO Native)
+
+위치: `~/.senpi/agent/sessions/<encoded-cwd>/*.jsonl` 및 `~/.omo/agent/sessions/<encoded-cwd>/*.jsonl` (OmO Native, omo-ai 5.1.0+), 그리고 각 프로젝트의 `.omo/senpi-task/children/` 아래 태스크 하위 세션
+
+Senpi는 Pi와 같은 JSONL 세션 형식을 사용합니다. OmO는 태스크 하위 세션을 각 프로젝트 안에 저장하므로, Tokscale은 두 세션 트리의 세션 헤더에서 `cwd`를 읽고 `<project>/.omo/senpi-task/children/`가 있는 모든 프로젝트에서 이 디렉터리를 스캔합니다. OmO의 `task.state_dir`가 절대 경로로 설정되어 있으면(프로젝트의 `.omo/omo.jsonc` 또는 `.omo/omo.json`, 또는 `~/.omo/` 아래의 같은 파일) 대신 `<state_dir>/children/`를 스캔합니다.
+
+OmO 에이전트 디렉터리가 다른 곳에 있다면 `~/.config/tokscale/settings.json`의 `scanner.extraScanPaths.senpi`에 추가하세요. 항목은 에이전트 디렉터리나 그 안의 `sessions/` 디렉터리를 가리킬 수 있습니다. Tokscale은 그곳의 세션을 스캔하고, 세션에 기록된 프로젝트의 태스크 하위 세션도 같은 방식으로 찾습니다:
+
+```json
+{
+  "scanner": {
+    "extraScanPaths": {
+      "senpi": ["/Users/me/custom/omo/agent"]
+    }
+  }
+}
 ```
 
 ### Prime Agent
