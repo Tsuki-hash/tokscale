@@ -2027,14 +2027,18 @@ fn is_anthropic_haiku_55_model(model_id: &str) -> bool {
     contains_delimited_fragment(&normalized, "claude-haiku-5-5")
 }
 
-fn is_anthropic_haiku_55_catalog_result(result: &LookupResult) -> bool {
+fn is_public_pricing_catalog_result(result: &LookupResult) -> bool {
     matches!(
         result.source.as_str(),
         "LiteLLM" | "Models.dev" | "OpenRouter"
-    ) && is_anthropic_haiku_55_model(&result.matched_key)
+    )
 }
 
-fn has_any_anthropic_haiku_55_100k_tier(pricing: &ModelPricing) -> bool {
+fn is_anthropic_haiku_55_catalog_result(result: &LookupResult) -> bool {
+    is_public_pricing_catalog_result(result) && is_anthropic_haiku_55_model(&result.matched_key)
+}
+
+fn has_any_valid_100k_tier(pricing: &ModelPricing) -> bool {
     [
         pricing.input_cost_per_token_above_100k_tokens,
         pricing.output_cost_per_token_above_100k_tokens,
@@ -2083,12 +2087,29 @@ fn should_prefer_anthropic_haiku_55_tiered_litellm(
 }
 
 fn covers_required_request_tiers(result: &LookupResult, usage: &TokenBreakdown) -> bool {
-    if !is_anthropic_haiku_55_catalog_result(result) {
+    if !is_public_pricing_catalog_result(result) {
         return true;
     }
 
-    let valid = |rate: Option<f64>| rate.is_some_and(is_valid_price_value);
     let cache_write = usage.cache_write.max(0);
+    let prompt_tokens = usage
+        .input
+        .max(0)
+        .saturating_add(usage.cache_read.max(0))
+        .saturating_add(cache_write);
+
+    // `compute_cost` has no generic 100K walk because the operator and
+    // request-vs-marginal semantics are provider-specific. If a catalog row
+    // publishes such a tier under an identity this engine has not verified,
+    // keep the short request covered but refuse to submit a long request at
+    // the flat base rates. `claude-haiku-latest` is one live example: it is a
+    // moving provider alias, not a stable Haiku 5.5 identity.
+    if !is_anthropic_haiku_55_catalog_result(result) {
+        return prompt_tokens <= ANTHROPIC_HAIKU_55_PRICING_THRESHOLD_TOKENS
+            || !has_any_valid_100k_tier(&result.pricing);
+    }
+
+    let valid = |rate: Option<f64>| rate.is_some_and(is_valid_price_value);
     let cache_write_1h = usage.cache_write_1h.max(0).min(cache_write);
     let cache_write_5m = cache_write.saturating_sub(cache_write_1h);
 
@@ -2099,11 +2120,6 @@ fn covers_required_request_tiers(result: &LookupResult, usage: &TokenBreakdown) 
         return false;
     }
 
-    let prompt_tokens = usage
-        .input
-        .max(0)
-        .saturating_add(usage.cache_read.max(0))
-        .saturating_add(cache_write);
     if prompt_tokens <= ANTHROPIC_HAIKU_55_PRICING_THRESHOLD_TOKENS {
         return true;
     }
@@ -2192,8 +2208,7 @@ fn has_valid_rate_pair(base: Option<f64>, above: Option<f64>) -> bool {
 }
 
 fn uses_anthropic_haiku_55_full_request_100k_pricing(result: &LookupResult) -> bool {
-    is_anthropic_haiku_55_catalog_result(result)
-        && has_any_anthropic_haiku_55_100k_tier(&result.pricing)
+    is_anthropic_haiku_55_catalog_result(result) && has_any_valid_100k_tier(&result.pricing)
 }
 
 fn compute_anthropic_haiku_55_full_request_100k_cost(
@@ -7782,6 +7797,19 @@ mod tests {
             .cache_creation_input_token_cost_above_1hr_above_100k_tokens = None;
         assert!(openrouter.covers_usage(&at_boundary));
         assert!(!openrouter.covers_usage(&long_input));
+
+        // models.dev publishes this moving OpenRouter alias with the same 100K
+        // tier. It is not a stable Haiku 5.5 identity, so preserve the short
+        // estimate but never submit a long request at the ignored base rate.
+        let moving_alias = anthropic_haiku_55_100k_result(
+            "openrouter/~anthropic/claude-haiku-latest",
+            "Models.dev",
+        );
+        assert!(!uses_anthropic_haiku_55_full_request_100k_pricing(
+            &moving_alias
+        ));
+        assert!(moving_alias.covers_usage(&at_boundary));
+        assert!(!moving_alias.covers_usage(&long_input));
     }
 
     #[test]
