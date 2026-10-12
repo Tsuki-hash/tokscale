@@ -3360,14 +3360,55 @@ fn parse_all_messages_streaming<S: MessageSink>(
         all_messages.extend(kilo_messages);
     }
 
-    let mut hermes_seen: HashSet<String> = HashSet::new();
+    // Hermes decides its day split at parse time (it allocates row buckets
+    // across days from the agent log), so it needs the pinned zone here — the
+    // post-parse `rebucket_days` pass cannot recover a split this grouping
+    // collapsed.
+    let hermes_bucket_timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
+    // The same session can reach two databases (default plus an extra scan
+    // path). Collect every database's copy of a group first, then emit the
+    // best-covered one: a copy the agent logs split across days beats a
+    // no-logs fallback that would keep the whole lifetime row on the start
+    // day — whichever database order the copies arrived in. Among equals the
+    // first database wins, and every day of the surviving copy is kept.
+    let mut hermes_group_order: Vec<(String, String, String)> = Vec::new();
+    let mut hermes_group_candidates: HashMap<(String, String, String), Vec<Vec<UnifiedMessage>>> =
+        HashMap::new();
     for db_path in scan_result.hermes_db_paths() {
-        let hermes_messages = parse_hermes_sqlite_with_pricing(&db_path, pricing);
-        all_messages.extend(
-            hermes_messages
-                .into_iter()
-                .filter(|message| should_keep_deduped_message(&mut hermes_seen, message)),
-        );
+        let messages = parse_hermes_sqlite_with_pricing(&db_path, pricing, &hermes_bucket_timezone);
+        let mut db_groups: HashMap<(String, String, String), Vec<UnifiedMessage>> = HashMap::new();
+        let mut db_group_order: Vec<(String, String, String)> = Vec::new();
+        for message in messages {
+            let group = (
+                message.session_id.clone(),
+                message.model_id.clone(),
+                message.provider_id.clone(),
+            );
+            if !db_groups.contains_key(&group) {
+                db_group_order.push(group.clone());
+            }
+            db_groups.entry(group).or_default().push(message);
+        }
+        for group in db_group_order {
+            let group_messages = db_groups.remove(&group).unwrap_or_default();
+            if !hermes_group_candidates.contains_key(&group) {
+                hermes_group_order.push(group.clone());
+            }
+            hermes_group_candidates
+                .entry(group)
+                .or_default()
+                .push(group_messages);
+        }
+    }
+    for group in hermes_group_order {
+        let candidates = hermes_group_candidates.remove(&group).unwrap_or_default();
+        let best = candidates
+            .iter()
+            .position(|messages| messages.iter().any(sessions::hermes::message_is_day_split))
+            .unwrap_or(0);
+        if let Some(messages) = candidates.into_iter().nth(best) {
+            all_messages.extend(messages);
+        }
     }
 
     if let Some(db_path) = &scan_result.goose_db {
@@ -5362,8 +5403,9 @@ fn merge_claude_cross_file_duplicate(
 fn parse_hermes_sqlite_with_pricing(
     db_path: &Path,
     pricing: Option<&pricing::PricingService>,
+    bucket_timezone: &bucket_tz::BucketTimezone,
 ) -> Vec<UnifiedMessage> {
-    sessions::hermes::parse_hermes_sqlite(db_path)
+    sessions::hermes::parse_hermes_sqlite_in(db_path, bucket_timezone)
         .into_iter()
         .map(|mut msg| {
             if msg.cost <= 0.0 {
@@ -6393,13 +6435,54 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
 
     let hermes_db_paths = scan_result.hermes_db_paths();
     if !hermes_db_paths.is_empty() {
-        let mut hermes_seen: HashSet<String> = HashSet::new();
-        let hermes_msgs: Vec<ParsedMessage> = hermes_db_paths
-            .iter()
-            .flat_map(|db_path| sessions::hermes::parse_hermes_sqlite(db_path))
-            .filter(|msg| should_keep_deduped_message(&mut hermes_seen, msg))
-            .map(|msg| unified_to_parsed(&msg))
-            .collect();
+        let hermes_bucket_timezone =
+            bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+        // Same best-covered cross-database dedup as the streaming path: a
+        // split copy beats a no-logs fallback whatever the database order.
+        let mut hermes_group_order: Vec<(String, String, String)> = Vec::new();
+        let mut hermes_group_candidates: HashMap<
+            (String, String, String),
+            Vec<Vec<UnifiedMessage>>,
+        > = HashMap::new();
+        for db_path in &hermes_db_paths {
+            let messages =
+                sessions::hermes::parse_hermes_sqlite_in(db_path, &hermes_bucket_timezone);
+            let mut db_groups: HashMap<(String, String, String), Vec<UnifiedMessage>> =
+                HashMap::new();
+            let mut db_group_order: Vec<(String, String, String)> = Vec::new();
+            for message in messages {
+                let group = (
+                    message.session_id.clone(),
+                    message.model_id.clone(),
+                    message.provider_id.clone(),
+                );
+                if !db_groups.contains_key(&group) {
+                    db_group_order.push(group.clone());
+                }
+                db_groups.entry(group).or_default().push(message);
+            }
+            for group in db_group_order {
+                let group_messages = db_groups.remove(&group).unwrap_or_default();
+                if !hermes_group_candidates.contains_key(&group) {
+                    hermes_group_order.push(group.clone());
+                }
+                hermes_group_candidates
+                    .entry(group)
+                    .or_default()
+                    .push(group_messages);
+            }
+        }
+        let mut hermes_msgs: Vec<ParsedMessage> = Vec::new();
+        for group in hermes_group_order {
+            let candidates = hermes_group_candidates.remove(&group).unwrap_or_default();
+            let best = candidates
+                .iter()
+                .position(|messages| messages.iter().any(sessions::hermes::message_is_day_split))
+                .unwrap_or(0);
+            if let Some(messages) = candidates.into_iter().nth(best) {
+                hermes_msgs.extend(messages.into_iter().map(|msg| unified_to_parsed(&msg)));
+            }
+        }
         let count = summed_parsed_message_count(&hermes_msgs);
         counts.set(ClientId::Hermes, count);
         messages.extend(hermes_msgs);
@@ -18883,6 +18966,176 @@ mod tests {
         assert_eq!(parsed.messages[0].session_id, "shared-hermes-session");
         assert_eq!(parsed.messages[0].input, 100);
         assert_eq!(parsed.messages[0].output, 25);
+    }
+
+    /// One Hermes main-loop `API call #N` log line for the fixed test
+    /// model/provider, matching the `session_model_usage` rows
+    /// `insert_hermes_session` writes.
+    fn hermes_api_call_log_line(session: &str, call: i64, stamp: &str, input: i64) -> String {
+        let output = input / 4;
+        format!(
+            "{stamp} INFO [{session}] agent.conversation_loop: API call #{call}: model=claude-sonnet-4 provider=anthropic in={input} out={output} total={} latency=1.0s cache=0/{input} (0%) id=gen-{call}",
+            input + output
+        )
+    }
+
+    #[test]
+    fn test_parse_local_clients_dedups_hermes_split_group_across_default_and_extra_dbs() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // Default database: the session, plus agent logs that split it across
+        // two logged days (60 and 40 fresh input, 15 and 10 output — the row's
+        // totals exactly, so no residual share).
+        let default_dir = temp_dir.path().join(".hermes");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let default_db = default_dir.join("state.db");
+        let default_conn = create_hermes_sqlite_db(&default_db);
+        insert_hermes_session(
+            &default_conn,
+            "shared-hermes-session",
+            "claude-sonnet-4",
+            2,
+            100,
+            25,
+            0.07,
+        );
+        drop(default_conn);
+        let logs_dir = default_dir.join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::write(
+            logs_dir.join("agent.log"),
+            format!(
+                "{}\n{}\n",
+                hermes_api_call_log_line("shared-hermes-session", 1, "2026-03-05 12:00:00,000", 60),
+                hermes_api_call_log_line("shared-hermes-session", 2, "2026-03-06 12:00:00,000", 40),
+            ),
+        )
+        .unwrap();
+
+        // Profile database: the same session again with no logs beside it, so
+        // it takes the whole-row fallback path.
+        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        let profile_conn = create_hermes_sqlite_db(&profile_db);
+        insert_hermes_session(
+            &profile_conn,
+            "shared-hermes-session",
+            "claude-sonnet-4",
+            9,
+            999,
+            999,
+            9.99,
+        );
+        drop(profile_conn);
+
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert("hermes".to_string(), vec![profile_db]);
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings {
+                extra_scan_paths,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        // The default database's two split days survive; the profile copy of
+        // the same group is dropped whole instead of landing as an undeduped
+        // third row next to the day-suffixed keys.
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 100);
+        assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 25);
+        assert!(
+            (parsed.messages.iter().map(|m| m.cost).sum::<f64>() - 0.07).abs() < 1e-9,
+            "the split days must carry the row's cost, and only once"
+        );
+        assert_eq!(
+            parsed.messages.iter().map(|m| m.message_count).sum::<i32>(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_parse_local_clients_prefers_split_copy_when_fallback_db_comes_first() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // Default database: the session with no logs beside it, so it takes
+        // the whole-row fallback path and is parsed first.
+        let default_dir = temp_dir.path().join(".hermes");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let default_db = default_dir.join("state.db");
+        let default_conn = create_hermes_sqlite_db(&default_db);
+        insert_hermes_session(
+            &default_conn,
+            "shared-hermes-session",
+            "claude-sonnet-4",
+            2,
+            100,
+            25,
+            0.07,
+        );
+        drop(default_conn);
+
+        // Profile database: the same session again, this time WITH logs that
+        // split it across two days. It is parsed second, so a first-wins
+        // dedup would keep the fallback and strand the later days on the
+        // start day — the bug this guards.
+        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        let profile_conn = create_hermes_sqlite_db(&profile_db);
+        insert_hermes_session(
+            &profile_conn,
+            "shared-hermes-session",
+            "claude-sonnet-4",
+            2,
+            100,
+            25,
+            0.07,
+        );
+        drop(profile_conn);
+        let logs_dir = profile_dir.join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::write(
+            logs_dir.join("agent.log"),
+            format!(
+                "{}\n{}\n",
+                hermes_api_call_log_line("shared-hermes-session", 1, "2026-03-05 12:00:00,000", 60),
+                hermes_api_call_log_line("shared-hermes-session", 2, "2026-03-06 12:00:00,000", 40),
+            ),
+        )
+        .unwrap();
+
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert("hermes".to_string(), vec![profile_db]);
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings {
+                extra_scan_paths,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        // The better-covered copy wins regardless of database order.
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 100);
+        assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 25);
+        assert!(
+            (parsed.messages.iter().map(|m| m.cost).sum::<f64>() - 0.07).abs() < 1e-9,
+            "the split days must carry the row's cost, and only once"
+        );
     }
 
     #[test]
