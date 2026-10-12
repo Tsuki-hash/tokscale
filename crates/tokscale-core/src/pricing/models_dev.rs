@@ -25,6 +25,24 @@ struct ModelCost {
     output: Option<f64>,
     cache_read: Option<f64>,
     cache_write: Option<f64>,
+    #[serde(default)]
+    tiers: Vec<ModelCostTier>,
+}
+
+#[derive(Deserialize)]
+struct ModelCostTier {
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+    tier: ContextTier,
+}
+
+#[derive(Deserialize)]
+struct ContextTier {
+    #[serde(rename = "type")]
+    kind: String,
+    size: u64,
 }
 
 pub type PricingDataset = HashMap<String, ModelPricing>;
@@ -95,12 +113,32 @@ fn map_providers(providers: HashMap<String, Provider>) -> PricingDataset {
 fn cost_to_pricing(cost: ModelCost) -> Option<ModelPricing> {
     let input = per_token(cost.input?)?;
     let output = per_token(cost.output?)?;
+    // models.dev currently encodes the same `> 100,000` boundary both as
+    // `size: 100000` and `size: 100001`, depending on the provider row. The
+    // Anthropic-specific pricing path decides the actual exclusive boundary;
+    // this mapping only preserves either spelling of the published rate card.
+    let above_100k = cost
+        .tiers
+        .iter()
+        .find(|tier| tier.tier.kind == "context" && matches!(tier.tier.size, 100_000 | 100_001));
 
     Some(ModelPricing {
         input_cost_per_token: Some(input),
+        input_cost_per_token_above_100k_tokens: above_100k
+            .and_then(|tier| tier.input)
+            .and_then(per_token),
         output_cost_per_token: Some(output),
+        output_cost_per_token_above_100k_tokens: above_100k
+            .and_then(|tier| tier.output)
+            .and_then(per_token),
         cache_read_input_token_cost: cost.cache_read.and_then(per_token),
+        cache_read_input_token_cost_above_100k_tokens: above_100k
+            .and_then(|tier| tier.cache_read)
+            .and_then(per_token),
         cache_creation_input_token_cost: cost.cache_write.and_then(per_token),
+        cache_creation_input_token_cost_above_100k_tokens: above_100k
+            .and_then(|tier| tier.cache_write)
+            .and_then(per_token),
         ..Default::default()
     })
 }
@@ -162,6 +200,51 @@ mod tests {
         });
 
         url
+    }
+
+    #[test]
+    fn parses_above_100k_context_tier_rates() {
+        let data = parse_dataset(
+            r#"{
+                "anthropic": {
+                    "models": {
+                        "claude-haiku-5-5": {
+                            "cost": {
+                                "input": 0.1,
+                                "output": 0.5,
+                                "cache_read": 0.01,
+                                "cache_write": 0.125,
+                                "tiers": [{
+                                    "input": 0.5,
+                                    "output": 2.5,
+                                    "cache_read": 0.05,
+                                    "cache_write": 0.625,
+                                    "tier": {"type": "context", "size": 100000}
+                                }]
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let pricing = data.get("anthropic/claude-haiku-5-5").unwrap();
+
+        let assert_rate = |actual: Option<f64>, expected: f64| {
+            let actual = actual.expect("the tier rate must be preserved");
+            assert!((actual - expected).abs() < 1e-18, "rate was {actual}");
+        };
+        assert_rate(pricing.input_cost_per_token_above_100k_tokens, 5e-7);
+        assert_rate(pricing.output_cost_per_token_above_100k_tokens, 2.5e-6);
+        assert_rate(pricing.cache_read_input_token_cost_above_100k_tokens, 5e-8);
+        assert_rate(
+            pricing.cache_creation_input_token_cost_above_100k_tokens,
+            6.25e-7,
+        );
+        assert_eq!(
+            pricing.cache_creation_input_token_cost_above_1hr_above_100k_tokens, None,
+            "models.dev does not publish a separate 1-hour cache-write rate"
+        );
     }
 
     #[tokio::test]

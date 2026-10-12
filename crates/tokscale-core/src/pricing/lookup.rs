@@ -83,6 +83,7 @@ const FUZZY_BLOCKLIST: &[&str] = &[
 ];
 
 const MAX_LOOKUP_CACHE_ENTRIES: usize = 512;
+const ANTHROPIC_HAIKU_55_PRICING_THRESHOLD_TOKENS: i64 = 100_000;
 const TIERED_PRICING_THRESHOLD_128K_TOKENS: f64 = 128_000.0;
 const TIERED_PRICING_THRESHOLD_200K_TOKENS: f64 = 200_000.0;
 const TIERED_PRICING_THRESHOLD_256K_TOKENS: f64 = 256_000.0;
@@ -353,6 +354,10 @@ impl LookupResult {
         self.evidence.subscription_namespace =
             key_root_is_zero_priced_subscription_namespace(&self.matched_key);
         self
+    }
+
+    pub(crate) fn covers_usage(&self, usage: &TokenBreakdown) -> bool {
+        self.pricing.covers_usage(usage) && covers_required_request_tiers(self, usage)
     }
 }
 
@@ -903,7 +908,13 @@ impl PricingLookup {
         }
 
         let exact_litellm = self.exact_match_litellm(model_id);
-        if should_prefer_openai_tiered_litellm(model_id, provider_id, exact_litellm.as_ref()) {
+        if should_prefer_openai_tiered_litellm(model_id, provider_id, exact_litellm.as_ref())
+            || should_prefer_anthropic_haiku_55_tiered_litellm(
+                model_id,
+                provider_id,
+                exact_litellm.as_ref(),
+            )
+        {
             return exact_litellm;
         }
 
@@ -2011,6 +2022,111 @@ fn quote_same_base_rates(hinted: &ModelPricing, canonical: &ModelPricing) -> boo
     shared
 }
 
+fn is_anthropic_haiku_55_model(model_id: &str) -> bool {
+    let normalized = model_id.to_ascii_lowercase().replace("5.5", "5-5");
+    contains_delimited_fragment(&normalized, "claude-haiku-5-5")
+}
+
+fn is_anthropic_haiku_55_catalog_result(result: &LookupResult) -> bool {
+    matches!(
+        result.source.as_str(),
+        "LiteLLM" | "Models.dev" | "OpenRouter"
+    ) && is_anthropic_haiku_55_model(&result.matched_key)
+}
+
+fn has_any_anthropic_haiku_55_100k_tier(pricing: &ModelPricing) -> bool {
+    [
+        pricing.input_cost_per_token_above_100k_tokens,
+        pricing.output_cost_per_token_above_100k_tokens,
+        pricing.cache_read_input_token_cost_above_100k_tokens,
+        pricing.cache_creation_input_token_cost_above_100k_tokens,
+        pricing.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+    ]
+    .into_iter()
+    .any(|rate| rate.is_some_and(is_valid_price_value))
+}
+
+fn has_complete_anthropic_haiku_55_100k_pricing(pricing: &ModelPricing) -> bool {
+    has_valid_rate_pair(
+        pricing.input_cost_per_token,
+        pricing.input_cost_per_token_above_100k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.output_cost_per_token,
+        pricing.output_cost_per_token_above_100k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.cache_read_input_token_cost,
+        pricing.cache_read_input_token_cost_above_100k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.cache_creation_input_token_cost,
+        pricing.cache_creation_input_token_cost_above_100k_tokens,
+    ) && match (
+        pricing.cache_creation_input_token_cost_above_1hr,
+        pricing.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+    ) {
+        (None, None) => true,
+        (base, above) => has_valid_rate_pair(base, above),
+    }
+}
+
+fn should_prefer_anthropic_haiku_55_tiered_litellm(
+    model_id: &str,
+    provider_id: Option<&str>,
+    litellm: Option<&LookupResult>,
+) -> bool {
+    provider_id.is_some_and(|provider| {
+        provider_identity::canonical_provider(provider).as_deref() == Some("anthropic")
+    }) && is_anthropic_haiku_55_model(model_id)
+        && litellm.is_some_and(|result| {
+            is_anthropic_haiku_55_catalog_result(result)
+                && has_complete_anthropic_haiku_55_100k_pricing(&result.pricing)
+        })
+}
+
+fn covers_required_request_tiers(result: &LookupResult, usage: &TokenBreakdown) -> bool {
+    if !is_anthropic_haiku_55_catalog_result(result) {
+        return true;
+    }
+
+    let valid = |rate: Option<f64>| rate.is_some_and(is_valid_price_value);
+    let cache_write = usage.cache_write.max(0);
+    let cache_write_1h = usage.cache_write_1h.max(0).min(cache_write);
+    let cache_write_5m = cache_write.saturating_sub(cache_write_1h);
+
+    // Unlike the generic fallback, Haiku 5.5 has a published, distinct 1-hour
+    // cache-write price. A flat 5-minute rate cannot cover that bucket even for
+    // a short prompt.
+    if cache_write_1h > 0 && !valid(result.pricing.cache_creation_input_token_cost_above_1hr) {
+        return false;
+    }
+
+    let prompt_tokens = usage
+        .input
+        .max(0)
+        .saturating_add(usage.cache_read.max(0))
+        .saturating_add(cache_write);
+    if prompt_tokens <= ANTHROPIC_HAIKU_55_PRICING_THRESHOLD_TOKENS {
+        return true;
+    }
+
+    (usage.input <= 0 || valid(result.pricing.input_cost_per_token_above_100k_tokens))
+        && (usage.output <= 0 && usage.reasoning <= 0
+            || valid(result.pricing.output_cost_per_token_above_100k_tokens))
+        && (usage.cache_read <= 0
+            || valid(result.pricing.cache_read_input_token_cost_above_100k_tokens))
+        && (cache_write_5m <= 0
+            || valid(
+                result
+                    .pricing
+                    .cache_creation_input_token_cost_above_100k_tokens,
+            ))
+        && (cache_write_1h <= 0
+            || valid(
+                result
+                    .pricing
+                    .cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+            ))
+}
+
 fn matches_model_or_snapshot(model_id: &str, base: &str) -> bool {
     model_id == base
         || model_id
@@ -2072,6 +2188,77 @@ fn has_complete_openai_272k_pricing(pricing: &ModelPricing) -> bool {
 
 fn has_valid_rate_pair(base: Option<f64>, above: Option<f64>) -> bool {
     base.is_some_and(is_valid_price_value) && above.is_some_and(is_valid_price_value)
+}
+
+fn uses_anthropic_haiku_55_full_request_100k_pricing(result: &LookupResult) -> bool {
+    is_anthropic_haiku_55_catalog_result(result)
+        && has_any_anthropic_haiku_55_100k_tier(&result.pricing)
+}
+
+fn compute_anthropic_haiku_55_full_request_100k_cost(
+    result: &LookupResult,
+    usage: &TokenBreakdown,
+) -> f64 {
+    let mut pricing = result.pricing.clone();
+    let prompt_tokens = usage
+        .input
+        .max(0)
+        .saturating_add(usage.cache_read.max(0))
+        .saturating_add(usage.cache_write.max(0));
+
+    // Anthropic documents the request-wide switch and every threshold bucket:
+    // https://platform.claude.com/docs/en/about-claude/pricing#long-context-pricing
+    // "Claude Haiku 5.5 is priced by prompt length: a request whose prompt is
+    // over 100,000 tokens pays higher prices. A request's prompt length counts
+    // all of its input tokens, including cache reads and cache writes. Each
+    // request is priced on its own: a request over the threshold pays the
+    // higher prices even when part of its prompt is a cache hit, and earlier
+    // requests keep the prices they were billed at."
+    if prompt_tokens > ANTHROPIC_HAIKU_55_PRICING_THRESHOLD_TOKENS {
+        let use_high = |high: Option<f64>, base: &mut Option<f64>| {
+            if high.is_some_and(is_valid_price_value) {
+                *base = high;
+            }
+        };
+        use_high(
+            pricing.input_cost_per_token_above_100k_tokens,
+            &mut pricing.input_cost_per_token,
+        );
+        use_high(
+            pricing.output_cost_per_token_above_100k_tokens,
+            &mut pricing.output_cost_per_token,
+        );
+        use_high(
+            pricing.cache_read_input_token_cost_above_100k_tokens,
+            &mut pricing.cache_read_input_token_cost,
+        );
+        use_high(
+            pricing.cache_creation_input_token_cost_above_100k_tokens,
+            &mut pricing.cache_creation_input_token_cost,
+        );
+        use_high(
+            pricing.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+            &mut pricing.cache_creation_input_token_cost_above_1hr,
+        );
+    }
+
+    // The request-level tier is already selected. These fields deliberately do
+    // not participate in `compute_cost`'s generic marginal tier walk.
+    pricing.input_cost_per_token_above_100k_tokens = None;
+    pricing.output_cost_per_token_above_100k_tokens = None;
+    pricing.cache_read_input_token_cost_above_100k_tokens = None;
+    pricing.cache_creation_input_token_cost_above_100k_tokens = None;
+    pricing.cache_creation_input_token_cost_above_1hr_above_100k_tokens = None;
+
+    compute_cost(
+        &pricing,
+        usage.input,
+        usage.output,
+        usage.cache_read,
+        usage.cache_write,
+        usage.cache_write_1h,
+        usage.reasoning,
+    )
 }
 
 fn uses_openai_full_request_272k_pricing(result: &LookupResult, provider_id: Option<&str>) -> bool {
@@ -2147,13 +2334,18 @@ fn uses_xai_full_request_200k_pricing(result: &LookupResult, provider_id: Option
         pricing.cache_read_input_token_cost_above_200k_tokens,
     );
     let has_other_context_tier = [
+        pricing.input_cost_per_token_above_100k_tokens,
         pricing.input_cost_per_token_above_128k_tokens,
         pricing.input_cost_per_token_above_256k_tokens,
         pricing.input_cost_per_token_above_272k_tokens,
+        pricing.output_cost_per_token_above_100k_tokens,
         pricing.output_cost_per_token_above_128k_tokens,
         pricing.output_cost_per_token_above_256k_tokens,
         pricing.output_cost_per_token_above_272k_tokens,
+        pricing.cache_read_input_token_cost_above_100k_tokens,
         pricing.cache_read_input_token_cost_above_272k_tokens,
+        pricing.cache_creation_input_token_cost_above_100k_tokens,
+        pricing.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
     ]
     .into_iter()
     .any(|rate| rate.is_some_and(is_valid_price_value));
@@ -2217,6 +2409,9 @@ fn compute_cost_for_lookup(
             usage.reasoning,
         )
     };
+    if uses_anthropic_haiku_55_full_request_100k_pricing(result) {
+        return compute_anthropic_haiku_55_full_request_100k_cost(result, usage);
+    }
     if uses_xai_full_request_200k_pricing(result, provider_id) {
         return compute_xai_full_request_200k_cost(result, usage);
     }
@@ -2385,10 +2580,11 @@ pub fn compute_cost(
             ),
         ],
     );
-    // Cache-read tiers stay limited to the 200k and 272k thresholds
-    // because upstream LiteLLM does not currently declare 128k or 256k
-    // cache-read pricing for any model. If upstream begins emitting
-    // those keys, also add matching fields to `ModelPricing`,
+    // The generic cache-read walk stays limited to 200k and 272k. Haiku
+    // 5.5's 100k rate is request-wide and is selected before this function;
+    // LiteLLM does not currently declare 128k or 256k cache-read pricing for
+    // any model. If upstream begins emitting those keys, also add matching
+    // fields to `ModelPricing`,
     // `has_any_valid_above_tier_value`, and `has_meaningful_tier_support`;
     // otherwise tier walks will silently undercost long-context cache reads
     // on those models. `has_any_usable_pricing` and
@@ -2815,8 +3011,8 @@ fn is_valid_price_value(value: f64) -> bool {
     value.is_finite() && value >= 0.0
 }
 
-/// Returns true if the pricing entry has at least one usable cost field
-/// (base or above-200k tier). Entries with all-None pricing (e.g.
+/// Returns true if the pricing entry has at least one usable cost field,
+/// base or long-context tier. Entries with all-None pricing (e.g.
 /// subscription-based providers like Perplexity) are useless for
 /// pay-per-token cost estimation and should be deprioritized.
 fn has_any_usable_pricing(pricing: &ModelPricing) -> bool {
@@ -2841,17 +3037,22 @@ fn lookup_result_if_usable(
 
 fn has_any_valid_above_tier_value(pricing: &ModelPricing) -> bool {
     [
+        pricing.input_cost_per_token_above_100k_tokens,
         pricing.input_cost_per_token_above_128k_tokens,
         pricing.input_cost_per_token_above_200k_tokens,
         pricing.input_cost_per_token_above_256k_tokens,
         pricing.input_cost_per_token_above_272k_tokens,
+        pricing.output_cost_per_token_above_100k_tokens,
         pricing.output_cost_per_token_above_128k_tokens,
         pricing.output_cost_per_token_above_200k_tokens,
         pricing.output_cost_per_token_above_256k_tokens,
         pricing.output_cost_per_token_above_272k_tokens,
+        pricing.cache_read_input_token_cost_above_100k_tokens,
         pricing.cache_read_input_token_cost_above_200k_tokens,
         pricing.cache_read_input_token_cost_above_272k_tokens,
+        pricing.cache_creation_input_token_cost_above_100k_tokens,
         pricing.cache_creation_input_token_cost_above_200k_tokens,
+        pricing.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
     ]
     .into_iter()
     .flatten()
@@ -2860,6 +3061,10 @@ fn has_any_valid_above_tier_value(pricing: &ModelPricing) -> bool {
 
 fn has_meaningful_tier_support(pricing: &ModelPricing) -> bool {
     [
+        (
+            pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_100k_tokens,
+        ),
         (
             pricing.input_cost_per_token,
             pricing.input_cost_per_token_above_128k_tokens,
@@ -2875,6 +3080,10 @@ fn has_meaningful_tier_support(pricing: &ModelPricing) -> bool {
         (
             pricing.input_cost_per_token,
             pricing.input_cost_per_token_above_272k_tokens,
+        ),
+        (
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_100k_tokens,
         ),
         (
             pricing.output_cost_per_token,
@@ -7371,6 +7580,27 @@ mod tests {
         assert!((cost - expected).abs() < 1e-12);
     }
 
+    fn anthropic_haiku_55_100k_result(key: &str, source: &str) -> LookupResult {
+        LookupResult {
+            matched_key: key.into(),
+            source: source.into(),
+            evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
+            pricing: ModelPricing {
+                input_cost_per_token: Some(1e-7),
+                input_cost_per_token_above_100k_tokens: Some(5e-7),
+                output_cost_per_token: Some(5e-7),
+                output_cost_per_token_above_100k_tokens: Some(2.5e-6),
+                cache_read_input_token_cost: Some(1e-8),
+                cache_read_input_token_cost_above_100k_tokens: Some(5e-8),
+                cache_creation_input_token_cost: Some(1.25e-7),
+                cache_creation_input_token_cost_above_100k_tokens: Some(6.25e-7),
+                cache_creation_input_token_cost_above_1hr: Some(2e-7),
+                cache_creation_input_token_cost_above_1hr_above_100k_tokens: Some(1e-6),
+                ..Default::default()
+            },
+        }
+    }
+
     fn openai_272k_result(key: &str, source: &str) -> LookupResult {
         LookupResult {
             matched_key: key.into(),
@@ -7403,6 +7633,170 @@ mod tests {
                 cache_read_input_token_cost_above_200k_tokens: Some(0.000001),
                 ..Default::default()
             },
+        }
+    }
+
+    #[test]
+    fn anthropic_haiku_55_100k_pricing_is_request_wide_and_exclusive() {
+        let result = anthropic_haiku_55_100k_result("claude-haiku-5-5", "LiteLLM");
+
+        for input in [99_999, 100_000] {
+            let usage = TokenBreakdown {
+                input,
+                output: 10,
+                ..Default::default()
+            };
+            let cost = compute_cost_for_lookup(&result, Some("anthropic"), &usage);
+            let expected = input as f64 * 1e-7 + 10.0 * 5e-7;
+            assert!((cost - expected).abs() < 1e-12, "input {input}: {cost}");
+        }
+
+        let usage = TokenBreakdown {
+            input: 100_001,
+            output: 10,
+            ..Default::default()
+        };
+        let cost = compute_cost_for_lookup(&result, Some("anthropic"), &usage);
+        let expected = 100_001.0 * 5e-7 + 10.0 * 2.5e-6;
+        assert!((cost - expected).abs() < 1e-12, "cost was {cost}");
+    }
+
+    #[test]
+    fn anthropic_haiku_55_threshold_and_rates_include_all_cache_buckets_once() {
+        let result = anthropic_haiku_55_100k_result("claude-haiku-5-5", "LiteLLM");
+        let usage = |cache_write| TokenBreakdown {
+            input: 40_000,
+            output: 100,
+            cache_read: 30_000,
+            cache_write,
+            cache_write_1h: 10_000,
+            reasoning: 20,
+        };
+
+        // cache_write_1h is a subset of cache_write. This prompt is exactly
+        // 100K, not 110K, so every bucket stays on its base rate.
+        let at_boundary = compute_cost_for_lookup(&result, Some("anthropic"), &usage(30_000));
+        let expected_at_boundary =
+            40_000.0 * 1e-7 + 120.0 * 5e-7 + 30_000.0 * 1e-8 + 20_000.0 * 1.25e-7 + 10_000.0 * 2e-7;
+        assert!((at_boundary - expected_at_boundary).abs() < 1e-12);
+
+        // One extra 5-minute write selects the high card for the entire
+        // request, including output/reasoning and the 1-hour write subset.
+        let above = compute_cost_for_lookup(&result, Some("anthropic"), &usage(30_001));
+        let expected_above = 40_000.0 * 5e-7
+            + 120.0 * 2.5e-6
+            + 30_000.0 * 5e-8
+            + 20_001.0 * 6.25e-7
+            + 10_000.0 * 1e-6;
+        assert!((above - expected_above).abs() < 1e-12);
+    }
+
+    #[test]
+    fn anthropic_haiku_55_aliases_and_regional_rows_use_the_same_request_tier() {
+        let canonical = anthropic_haiku_55_100k_result("claude-haiku-5-5", "LiteLLM");
+        let lookup = PricingLookup::new(
+            HashMap::from([("claude-haiku-5-5".into(), canonical.pricing.clone())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let usage = TokenBreakdown {
+            input: 100_001,
+            output: 1,
+            ..Default::default()
+        };
+        let expected = 100_001.0 * 5e-7 + 2.5e-6;
+
+        for alias in ["claude-haiku-5-5-high", "claude-haiku-5.5-low"] {
+            let resolved = lookup
+                .lookup_with_provider(alias, Some("anthropic"))
+                .expect("the tier alias must resolve");
+            assert_eq!(resolved.matched_key, "claude-haiku-5-5");
+            assert!(resolved.evidence.alias_applied);
+            let cost = lookup.calculate_cost_with_provider(alias, Some("anthropic"), &usage);
+            assert!((cost - expected).abs() < 1e-12, "alias {alias}: {cost}");
+        }
+
+        let mut regional =
+            anthropic_haiku_55_100k_result("eu.anthropic.claude-haiku-5-5", "LiteLLM");
+        regional.pricing.input_cost_per_token = Some(1.1e-7);
+        regional.pricing.input_cost_per_token_above_100k_tokens = Some(5.5e-7);
+        regional.pricing.output_cost_per_token = Some(5.5e-7);
+        regional.pricing.output_cost_per_token_above_100k_tokens = Some(2.75e-6);
+        assert!(uses_anthropic_haiku_55_full_request_100k_pricing(&regional));
+        let cost = compute_cost_for_lookup(&regional, Some("bedrock"), &usage);
+        let regional_expected = 100_001.0 * 5.5e-7 + 2.75e-6;
+        assert!((cost - regional_expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn anthropic_haiku_55_long_context_coverage_is_source_and_bucket_aware() {
+        let long_input = TokenBreakdown {
+            input: 100_001,
+            output: 1,
+            ..Default::default()
+        };
+        let at_boundary = TokenBreakdown {
+            input: 100_000,
+            output: 1,
+            ..Default::default()
+        };
+
+        let litellm = anthropic_haiku_55_100k_result("claude-haiku-5-5", "LiteLLM");
+        assert!(litellm.covers_usage(&long_input));
+
+        let mut models_dev =
+            anthropic_haiku_55_100k_result("anthropic/claude-haiku-5-5", "Models.dev");
+        models_dev.pricing.cache_creation_input_token_cost_above_1hr = None;
+        models_dev
+            .pricing
+            .cache_creation_input_token_cost_above_1hr_above_100k_tokens = None;
+        assert!(models_dev.covers_usage(&long_input));
+        assert!(
+            (compute_cost_for_lookup(&models_dev, Some("anthropic"), &long_input)
+                - (100_001.0 * 5e-7 + 2.5e-6))
+                .abs()
+                < 1e-12
+        );
+
+        let long_hourly_write = TokenBreakdown {
+            input: 100_000,
+            cache_write: 1,
+            cache_write_1h: 1,
+            ..Default::default()
+        };
+        assert!(!models_dev.covers_usage(&long_hourly_write));
+
+        let mut openrouter =
+            anthropic_haiku_55_100k_result("anthropic/claude-haiku-5.5", "OpenRouter");
+        openrouter.pricing.input_cost_per_token_above_100k_tokens = None;
+        openrouter.pricing.output_cost_per_token_above_100k_tokens = None;
+        openrouter
+            .pricing
+            .cache_read_input_token_cost_above_100k_tokens = None;
+        openrouter
+            .pricing
+            .cache_creation_input_token_cost_above_100k_tokens = None;
+        openrouter
+            .pricing
+            .cache_creation_input_token_cost_above_1hr_above_100k_tokens = None;
+        assert!(openrouter.covers_usage(&at_boundary));
+        assert!(!openrouter.covers_usage(&long_input));
+    }
+
+    #[test]
+    fn anthropic_100k_fields_do_not_change_sonnet_or_opus_pricing() {
+        let usage = TokenBreakdown {
+            input: 100_001,
+            output: 10,
+            ..Default::default()
+        };
+        let expected = 100_001.0 * 1e-7 + 10.0 * 5e-7;
+
+        for model in ["claude-sonnet-5-5", "claude-opus-5-5"] {
+            let result = anthropic_haiku_55_100k_result(model, "LiteLLM");
+            assert!(!uses_anthropic_haiku_55_full_request_100k_pricing(&result));
+            let cost = compute_cost_for_lookup(&result, Some("anthropic"), &usage);
+            assert!((cost - expected).abs() < 1e-12, "model {model}: {cost}");
         }
     }
 
