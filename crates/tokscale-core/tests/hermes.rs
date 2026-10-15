@@ -1381,6 +1381,7 @@ fn log_call(session: &str, call: i64, stamp: &str, prompt: i64, output: i64, cac
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_call_with_provider_and_write(
     session: &str,
     call: i64,
