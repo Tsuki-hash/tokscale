@@ -3365,51 +3365,12 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // post-parse `rebucket_days` pass cannot recover a split this grouping
     // collapsed.
     let hermes_bucket_timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
-    // The same session can reach two databases (default plus an extra scan
-    // path). Collect every database's copy of a group first, then emit the
-    // best-covered one: a copy the agent logs split across days beats a
-    // no-logs fallback that would keep the whole lifetime row on the start
-    // day — whichever database order the copies arrived in. Among equals the
-    // first database wins, and every day of the surviving copy is kept.
-    let mut hermes_group_order: Vec<(String, String, String)> = Vec::new();
-    let mut hermes_group_candidates: HashMap<(String, String, String), Vec<Vec<UnifiedMessage>>> =
-        HashMap::new();
-    for db_path in scan_result.hermes_db_paths() {
-        let messages = parse_hermes_sqlite_with_pricing(&db_path, pricing, &hermes_bucket_timezone);
-        let mut db_groups: HashMap<(String, String, String), Vec<UnifiedMessage>> = HashMap::new();
-        let mut db_group_order: Vec<(String, String, String)> = Vec::new();
-        for message in messages {
-            let group = (
-                message.session_id.clone(),
-                message.model_id.clone(),
-                message.provider_id.clone(),
-            );
-            if !db_groups.contains_key(&group) {
-                db_group_order.push(group.clone());
-            }
-            db_groups.entry(group).or_default().push(message);
-        }
-        for group in db_group_order {
-            let group_messages = db_groups.remove(&group).unwrap_or_default();
-            if !hermes_group_candidates.contains_key(&group) {
-                hermes_group_order.push(group.clone());
-            }
-            hermes_group_candidates
-                .entry(group)
-                .or_default()
-                .push(group_messages);
-        }
-    }
-    for group in hermes_group_order {
-        let candidates = hermes_group_candidates.remove(&group).unwrap_or_default();
-        let best = candidates
-            .iter()
-            .position(|messages| messages.iter().any(sessions::hermes::message_is_day_split))
-            .unwrap_or(0);
-        if let Some(messages) = candidates.into_iter().nth(best) {
-            all_messages.extend(messages);
-        }
-    }
+    let hermes_databases = scan_result
+        .hermes_db_paths()
+        .into_iter()
+        .map(|db_path| parse_hermes_sqlite_with_pricing(&db_path, pricing, &hermes_bucket_timezone))
+        .collect();
+    all_messages.extend(select_best_covered_hermes_groups(hermes_databases));
 
     if let Some(db_path) = &scan_result.goose_db {
         let goose_messages: Vec<UnifiedMessage> = sessions::goose::parse_goose_sqlite(db_path)
@@ -5400,6 +5361,120 @@ fn merge_claude_cross_file_duplicate(
     apply_pricing_if_available(existing, pricing);
 }
 
+fn hermes_candidate_totals(messages: &[UnifiedMessage]) -> ([i128; 6], f64) {
+    let mut tokens = [0_i128; 6];
+    let mut cost = 0.0;
+    for message in messages {
+        tokens[0] += message.tokens.input as i128;
+        tokens[1] += message.tokens.output as i128;
+        tokens[2] += message.tokens.cache_read as i128;
+        tokens[3] += message.tokens.cache_write as i128;
+        tokens[4] += message.tokens.cache_write_1h as i128;
+        tokens[5] += message.tokens.reasoning as i128;
+        cost += message.cost;
+    }
+    (tokens, cost)
+}
+
+fn hermes_candidates_have_same_usage(a: &[UnifiedMessage], b: &[UnifiedMessage]) -> bool {
+    let (a_tokens, a_cost) = hermes_candidate_totals(a);
+    let (b_tokens, b_cost) = hermes_candidate_totals(b);
+    let cost_scale = a_cost.abs().max(b_cost.abs()).max(1.0);
+    a_tokens == b_tokens && (a_cost - b_cost).abs() <= 1e-9 * cost_scale
+}
+
+/// Select one copy of each Hermes (session, model, provider) group when the
+/// same database is discovered through default and extra roots. A log-split
+/// copy beats a start-day fallback only when their authoritative token and cost
+/// totals agree; otherwise the first database wins rather than replacing a
+/// complete row with a stale partial copy.
+///
+/// `message_count` belongs to the session rather than any model group. Group-
+/// by-group selection can mix copies from different databases whose primary
+/// model differs, so normalize the first database's count onto exactly one of
+/// the selected messages after choosing every group.
+fn select_best_covered_hermes_groups(databases: Vec<Vec<UnifiedMessage>>) -> Vec<UnifiedMessage> {
+    let mut group_order: Vec<(String, String, String)> = Vec::new();
+    let mut group_candidates: HashMap<(String, String, String), Vec<Vec<UnifiedMessage>>> =
+        HashMap::new();
+    let mut session_message_counts: HashMap<String, i32> = HashMap::new();
+
+    for messages in databases {
+        let mut database_session_counts: HashMap<String, i32> = HashMap::new();
+        for message in &messages {
+            database_session_counts
+                .entry(message.session_id.clone())
+                .and_modify(|count| *count = (*count).max(message.message_count))
+                .or_insert(message.message_count);
+        }
+        for (session_id, count) in database_session_counts {
+            session_message_counts.entry(session_id).or_insert(count);
+        }
+
+        let mut database_groups: HashMap<(String, String, String), Vec<UnifiedMessage>> =
+            HashMap::new();
+        let mut database_group_order: Vec<(String, String, String)> = Vec::new();
+        for message in messages {
+            let group = (
+                message.session_id.clone(),
+                message.model_id.clone(),
+                message.provider_id.clone(),
+            );
+            if !database_groups.contains_key(&group) {
+                database_group_order.push(group.clone());
+            }
+            database_groups.entry(group).or_default().push(message);
+        }
+        for group in database_group_order {
+            let group_messages = database_groups.remove(&group).unwrap_or_default();
+            if !group_candidates.contains_key(&group) {
+                group_order.push(group.clone());
+            }
+            group_candidates
+                .entry(group)
+                .or_default()
+                .push(group_messages);
+        }
+    }
+
+    let mut selected = Vec::new();
+    for group in group_order {
+        let candidates = group_candidates.remove(&group).unwrap_or_default();
+        let best = candidates.first().map_or(0, |baseline| {
+            if baseline.iter().any(sessions::hermes::message_is_day_split) {
+                0
+            } else {
+                candidates
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find(|(_, messages)| {
+                        messages.iter().any(sessions::hermes::message_is_day_split)
+                            && hermes_candidates_have_same_usage(baseline, messages)
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(0)
+            }
+        });
+        if let Some(messages) = candidates.into_iter().nth(best) {
+            selected.extend(messages);
+        }
+    }
+
+    let mut counted_sessions = HashSet::new();
+    for message in &mut selected {
+        message.message_count = if counted_sessions.insert(message.session_id.clone()) {
+            session_message_counts
+                .get(&message.session_id)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+    }
+    selected
+}
+
 fn parse_hermes_sqlite_with_pricing(
     db_path: &Path,
     pricing: Option<&pricing::PricingService>,
@@ -6437,52 +6512,16 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     if !hermes_db_paths.is_empty() {
         let hermes_bucket_timezone =
             bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
-        // Same best-covered cross-database dedup as the streaming path: a
-        // split copy beats a no-logs fallback whatever the database order.
-        let mut hermes_group_order: Vec<(String, String, String)> = Vec::new();
-        let mut hermes_group_candidates: HashMap<
-            (String, String, String),
-            Vec<Vec<UnifiedMessage>>,
-        > = HashMap::new();
-        for db_path in &hermes_db_paths {
-            let messages =
-                sessions::hermes::parse_hermes_sqlite_in(db_path, &hermes_bucket_timezone);
-            let mut db_groups: HashMap<(String, String, String), Vec<UnifiedMessage>> =
-                HashMap::new();
-            let mut db_group_order: Vec<(String, String, String)> = Vec::new();
-            for message in messages {
-                let group = (
-                    message.session_id.clone(),
-                    message.model_id.clone(),
-                    message.provider_id.clone(),
-                );
-                if !db_groups.contains_key(&group) {
-                    db_group_order.push(group.clone());
-                }
-                db_groups.entry(group).or_default().push(message);
-            }
-            for group in db_group_order {
-                let group_messages = db_groups.remove(&group).unwrap_or_default();
-                if !hermes_group_candidates.contains_key(&group) {
-                    hermes_group_order.push(group.clone());
-                }
-                hermes_group_candidates
-                    .entry(group)
-                    .or_default()
-                    .push(group_messages);
-            }
-        }
-        let mut hermes_msgs: Vec<ParsedMessage> = Vec::new();
-        for group in hermes_group_order {
-            let candidates = hermes_group_candidates.remove(&group).unwrap_or_default();
-            let best = candidates
-                .iter()
-                .position(|messages| messages.iter().any(sessions::hermes::message_is_day_split))
-                .unwrap_or(0);
-            if let Some(messages) = candidates.into_iter().nth(best) {
-                hermes_msgs.extend(messages.into_iter().map(|msg| unified_to_parsed(&msg)));
-            }
-        }
+        let hermes_databases = hermes_db_paths
+            .iter()
+            .map(|db_path| {
+                sessions::hermes::parse_hermes_sqlite_in(db_path, &hermes_bucket_timezone)
+            })
+            .collect();
+        let hermes_msgs: Vec<ParsedMessage> = select_best_covered_hermes_groups(hermes_databases)
+            .iter()
+            .map(unified_to_parsed)
+            .collect();
         let count = summed_parsed_message_count(&hermes_msgs);
         counts.set(ClientId::Hermes, count);
         messages.extend(hermes_msgs);
@@ -7010,13 +7049,13 @@ mod tests {
         parse_all_messages_with_pricing_with_cache_policy,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
         paths, prepare_submission_pricing, pricing, retain_for_requested_clients, scanner,
-        select_local_parse_pricing, sessions, unified_to_parsed, validate_priced_messages,
-        ClientId, GraphPricingRequirement, GraphSink, GroupBy, LocalParseOptions, MessageSink,
-        MonthlyReportV2, MonthlyUsage, MonthlyUsageV2, ReportOptions, SourceCachePolicy,
-        TokenBreakdown, UnifiedMessage, UnpricedSubmissionUsage, AMBIGUOUS_MODEL_PRICING_REASON,
-        GRAPH_SINK_BATCH, INCOMPLETE_MODEL_PRICING_REASON, MISSING_MODEL_PRICING_REASON,
-        ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL, UNVERIFIED_MODEL_IDENTITY_REASON,
-        UNVERIFIED_PROVIDER_IDENTITY_REASON,
+        select_best_covered_hermes_groups, select_local_parse_pricing, sessions, unified_to_parsed,
+        validate_priced_messages, ClientId, GraphPricingRequirement, GraphSink, GroupBy,
+        LocalParseOptions, MessageSink, MonthlyReportV2, MonthlyUsage, MonthlyUsageV2,
+        ReportOptions, SourceCachePolicy, TokenBreakdown, UnifiedMessage, UnpricedSubmissionUsage,
+        AMBIGUOUS_MODEL_PRICING_REASON, GRAPH_SINK_BATCH, INCOMPLETE_MODEL_PRICING_REASON,
+        MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
+        UNVERIFIED_MODEL_IDENTITY_REASON, UNVERIFIED_PROVIDER_IDENTITY_REASON,
     };
     // Kept as its own statement rather than folded into the list above: that list
     // is edited by nearly every PR that touches this file, and sharing it made
@@ -18909,6 +18948,60 @@ mod tests {
 
         assert_eq!(parsed.counts.get(ClientId::Zed), 0);
         assert!(parsed.messages.is_empty());
+    }
+
+    #[test]
+    fn test_hermes_cross_database_selection_credits_session_count_once() {
+        let message = |model: &str, message_count: i32, split: bool| {
+            let mut message = UnifiedMessage::new(
+                "hermes",
+                model,
+                "anthropic",
+                "shared-session",
+                1_775_100_000_000,
+                TokenBreakdown {
+                    input: 10,
+                    ..Default::default()
+                },
+                0.01,
+            );
+            message.message_count = message_count;
+            message.dedup_key = Some(if split {
+                format!("hermes:shared-session:{model}:anthropic:2026-04-01")
+            } else {
+                format!("hermes:shared-session:{model}:anthropic")
+            });
+            message
+        };
+
+        // Per-group selection would otherwise choose two zero-count secondary
+        // groups and lose the session count completely.
+        let lost = select_best_covered_hermes_groups(vec![
+            vec![message("model-a", 7, false), message("model-b", 0, true)],
+            vec![message("model-a", 0, true), message("model-b", 7, false)],
+        ]);
+        assert_eq!(lost.iter().map(|m| m.message_count).sum::<i32>(), 7);
+
+        // The opposite log placement would choose both databases' primary
+        // groups and double the same session count without normalization.
+        let doubled = select_best_covered_hermes_groups(vec![
+            vec![message("model-a", 7, true), message("model-b", 0, false)],
+            vec![message("model-a", 0, false), message("model-b", 7, true)],
+        ]);
+        assert_eq!(doubled.iter().map(|m| m.message_count).sum::<i32>(), 7);
+
+        // A day suffix is not enough to prove that a later database is the
+        // same authoritative row. Do not let a stale ten-token split replace
+        // the first database's complete thousand-token fallback.
+        let mut complete = message("model-a", 7, false);
+        complete.tokens.input = 1_000;
+        complete.cost = 1.0;
+        let stale_split = message("model-a", 7, true);
+        let mismatched = select_best_covered_hermes_groups(vec![vec![complete], vec![stale_split]]);
+        assert_eq!(mismatched.len(), 1);
+        assert_eq!(mismatched[0].tokens.input, 1_000);
+        assert_eq!(mismatched[0].cost, 1.0);
+        assert!(!sessions::hermes::message_is_day_split(&mismatched[0]));
     }
 
     #[test]
