@@ -2,7 +2,9 @@ use rusqlite::{params, Connection};
 use std::collections::HashSet;
 use tempfile::TempDir;
 use tokscale_core::bucket_tz::BucketTimezone;
-use tokscale_core::sessions::hermes::{parse_hermes_sqlite, parse_hermes_sqlite_in};
+use tokscale_core::sessions::hermes::{
+    message_is_day_split, parse_hermes_sqlite, parse_hermes_sqlite_in,
+};
 
 #[test]
 fn test_parse_hermes_sqlite_returns_empty_for_missing_database() {
@@ -1379,6 +1381,23 @@ fn log_call(session: &str, call: i64, stamp: &str, prompt: i64, output: i64, cac
     )
 }
 
+fn log_call_with_provider_and_write(
+    session: &str,
+    call: i64,
+    stamp: &str,
+    provider: &str,
+    prompt: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+) -> String {
+    let model = "glm-5.2";
+    let total = prompt + output;
+    format!(
+        "{stamp} INFO [{session}] agent.conversation_loop: API call #{call}: model={model} provider={provider} in={prompt} out={output} total={total} latency=1.0s cache={cache_read}/{prompt} (50%) write={cache_write} id=gen-{call}"
+    )
+}
+
 fn write_agent_log(dir: &TempDir, lines: &[String]) {
     let logs = dir.path().join("logs");
     std::fs::create_dir_all(&logs).unwrap();
@@ -1404,6 +1423,20 @@ fn insert_usage_row(
     cache_read: i64,
     cost: f64,
 ) {
+    insert_usage_row_with_route(conn, session, "zai", input, output, cache_read, 0, cost);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_usage_row_with_route(
+    conn: &Connection,
+    session: &str,
+    provider: &str,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cost: f64,
+) {
     let sql = r#"
         INSERT INTO session_model_usage (
             session_id, model, billing_provider, billing_base_url, billing_mode, task,
@@ -1414,16 +1447,27 @@ fn insert_usage_row(
     conn.execute(
         sql,
         params![
-            session, "glm-5.2", "zai", "", "", "", input, output, cache_read, 0_i64, 0_i64,
-            0.0_f64, cost
+            session,
+            "glm-5.2",
+            provider,
+            "",
+            "",
+            "",
+            input,
+            output,
+            cache_read,
+            cache_write,
+            0_i64,
+            0.0_f64,
+            cost
         ],
     )
     .unwrap();
 }
 
 /// A session that started two days ago and was used again yesterday reports one
-/// message per active day, with the row's buckets split across them by each
-/// day's logged token weight — the database totals stay authoritative.
+/// message per active day, with each logged bucket kept on the day that
+/// produced it — the database totals stay authoritative.
 #[test]
 fn test_parse_hermes_sqlite_splits_cross_day_session_by_logged_calls() {
     let dir = TempDir::new().unwrap();
@@ -1453,14 +1497,16 @@ fn test_parse_hermes_sqlite_splits_cross_day_session_by_logged_calls() {
     assert_eq!(messages.len(), 2, "one message per active day");
     messages.sort_by_key(|m| m.timestamp);
 
-    // Day A: weight 2*(200+100+800)=2200 of 5500; day B: 3300.
+    // Each bucket stays on the day whose calls reported it. A shared overall
+    // weight would incorrectly move fresh-input and cache-read tokens between
+    // these differently shaped days.
     let (a, b) = (&messages[0], &messages[1]);
-    assert_eq!(a.tokens.input, 560);
+    assert_eq!(a.tokens.input, 400);
     assert_eq!(a.tokens.output, 200);
-    assert_eq!(a.tokens.cache_read, 1440);
-    assert_eq!(b.tokens.input, 840);
+    assert_eq!(a.tokens.cache_read, 1600);
+    assert_eq!(b.tokens.input, 1000);
     assert_eq!(b.tokens.output, 300);
-    assert_eq!(b.tokens.cache_read, 2160);
+    assert_eq!(b.tokens.cache_read, 2000);
     // Exact split: the parts sum back to the authoritative row.
     assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 1400);
     assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 500);
@@ -1481,6 +1527,165 @@ fn test_parse_hermes_sqlite_splits_cross_day_session_by_logged_calls() {
 
     // The session message_count is still credited exactly once.
     assert_eq!(messages.iter().map(|m| m.message_count).sum::<i32>(), 12);
+}
+
+/// `in=` includes fresh, cache-read, and cache-write prompt tokens. Cache
+/// writes must be removed from fresh input as well as retained in their own
+/// bucket, or the over-report guard rejects every cache-write session.
+#[test]
+fn test_parse_hermes_sqlite_splits_cache_write_calls() {
+    let dir = TempDir::new().unwrap();
+    let db_path = create_test_db(&dir);
+    let conn = Connection::open(&db_path).unwrap();
+
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params!["session-cache-write", "desktop", "glm-5.2", 1_775_100_000.0_f64, 2_i64],
+    )
+    .unwrap();
+    insert_usage_row_with_route(
+        &conn,
+        "session-cache-write",
+        "zai",
+        300,
+        100,
+        400,
+        800,
+        0.75,
+    );
+    let day_a = log_stamp(2, 9);
+    let day_b = log_stamp(1, 9);
+    write_agent_log(
+        &dir,
+        &[
+            log_call_with_provider_and_write(
+                "session-cache-write",
+                1,
+                &day_a,
+                "zai",
+                1000,
+                40,
+                400,
+                500,
+            ),
+            log_call_with_provider_and_write(
+                "session-cache-write",
+                2,
+                &day_b,
+                "zai",
+                500,
+                60,
+                0,
+                300,
+            ),
+        ],
+    );
+
+    let mut messages = parse_hermes_sqlite(&db_path);
+    messages.sort_by_key(|message| message.timestamp);
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].tokens.input, 100);
+    assert_eq!(messages[0].tokens.output, 40);
+    assert_eq!(messages[0].tokens.cache_read, 400);
+    assert_eq!(messages[0].tokens.cache_write, 500);
+    assert_eq!(messages[1].tokens.input, 200);
+    assert_eq!(messages[1].tokens.output, 60);
+    assert_eq!(messages[1].tokens.cache_read, 0);
+    assert_eq!(messages[1].tokens.cache_write, 300);
+}
+
+/// Current Hermes persists a missing provider as an empty string but logs it
+/// as `provider=unknown`. The lookup forms must meet without changing the
+/// output row's provider/dedup identity.
+#[test]
+fn test_parse_hermes_sqlite_matches_providerless_log_calls() {
+    let dir = TempDir::new().unwrap();
+    let db_path = create_test_db(&dir);
+    let conn = Connection::open(&db_path).unwrap();
+
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params!["session-providerless", "desktop", "glm-5.2", 1_775_100_000.0_f64, 2_i64],
+    )
+    .unwrap();
+    insert_usage_row_with_route(&conn, "session-providerless", "", 400, 40, 0, 0, 0.2);
+    let day_a = log_stamp(2, 9);
+    let day_b = log_stamp(1, 9);
+    write_agent_log(
+        &dir,
+        &[
+            log_call_with_provider_and_write(
+                "session-providerless",
+                1,
+                &day_a,
+                "unknown",
+                200,
+                20,
+                0,
+                0,
+            ),
+            log_call_with_provider_and_write(
+                "session-providerless",
+                2,
+                &day_b,
+                "unknown",
+                200,
+                20,
+                0,
+                0,
+            ),
+        ],
+    );
+
+    let messages = parse_hermes_sqlite(&db_path);
+    assert_eq!(messages.len(), 2, "both providerless log days must split");
+    assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 400);
+    assert!(messages.iter().all(message_is_day_split));
+}
+
+/// Hermes starts `session_api_calls` at zero for each agent process, including
+/// when an existing conversation is resumed. Distinct calls can therefore
+/// reuse the same number on different days. Exact rotated-log duplicates still
+/// count once, but the resumed call must survive and create its later day.
+#[test]
+fn test_parse_hermes_sqlite_keeps_reused_call_numbers_after_resume() {
+    let dir = TempDir::new().unwrap();
+    let db_path = create_test_db(&dir);
+    let conn = Connection::open(&db_path).unwrap();
+
+    conn.execute(
+        "INSERT INTO sessions (id, source, model, started_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params!["session-resumed", "desktop", "glm-5.2", 1_775_100_000.0_f64, 4_i64],
+    )
+    .unwrap();
+    // Two valid calls each contribute 200 fresh input, 100 output, and 800
+    // cache-read tokens. The first line is repeated to simulate overlap from a
+    // rotated log and must not inflate the authoritative row.
+    insert_usage_row(&conn, "session-resumed", 400, 200, 1600, 0.5);
+    let day_a = log_stamp(2, 9);
+    let day_b = log_stamp(1, 9);
+    let first = log_call("session-resumed", 1, &day_a, 1000, 100, 800);
+    let resumed = log_call("session-resumed", 1, &day_b, 1000, 100, 800);
+    write_agent_log(&dir, &[first.clone(), first, resumed]);
+
+    let mut messages = parse_hermes_sqlite(&db_path);
+    messages.sort_by_key(|message| message.timestamp);
+    assert_eq!(messages.len(), 2, "both active days must survive");
+    assert_eq!(messages[0].tokens.input, 200);
+    assert_eq!(messages[1].tokens.input, 200);
+    assert_eq!(messages[0].tokens.output, 100);
+    assert_eq!(messages[1].tokens.output, 100);
+    assert_eq!(messages[0].tokens.cache_read, 800);
+    assert_eq!(messages[1].tokens.cache_read, 800);
+    assert!(messages[0]
+        .dedup_key
+        .as_deref()
+        .is_some_and(|key| key.ends_with(&day_a[..10])));
+    assert!(messages[1]
+        .dedup_key
+        .as_deref()
+        .is_some_and(|key| key.ends_with(&day_b[..10])));
+    assert_eq!(messages.iter().map(|m| m.message_count).sum::<i32>(), 4);
 }
 
 /// Logs that claim more than the authoritative row (rotated into a foreign

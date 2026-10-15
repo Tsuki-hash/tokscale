@@ -39,6 +39,10 @@ const HERMES_AGENT_NAME: &str = "Hermes Agent";
 /// brackets keep it out of the slug space real provider ids live in.
 const NULL_PROVIDER_KEY: &str = "<null>";
 
+/// Hermes renders a missing runtime provider as this value in `agent.log`,
+/// while current `session_model_usage` rows persist it as an empty string.
+const UNKNOWN_LOG_PROVIDER_KEY: &str = "unknown";
+
 /// Marker of a main-loop per-call log line. The usage-unavailable variant
 /// (`in=? out=? usage=unavailable`) carries no figures and is skipped.
 const API_CALL_LOG_MARKER: &str = " agent.conversation_loop: API call #";
@@ -169,8 +173,8 @@ fn query_usage_rows(db_path: &Path, conn: &Connection, query: &str) -> Option<Ve
 }
 
 /// One `API call #N` line from a Hermes agent log: the timestamped evidence a
-/// cross-day session's buckets are split over. `input` is the non-cached prompt
-/// share (`in` minus `cache`), matching what Hermes stores in
+/// cross-day session's buckets are split over. `input` is the fresh prompt
+/// share (`in` minus cache reads and writes), matching what Hermes stores in
 /// `session_model_usage.input_tokens`.
 struct LoggedCall {
     call_number: i64,
@@ -180,6 +184,8 @@ struct LoggedCall {
     cache_read: i64,
     cache_write: i64,
 }
+
+type LoggedCallFingerprint = (String, String, String, i64, i64, i64, i64, i64, i64);
 
 /// Parse `2026-10-12 16:38:13,024 INFO [sid] agent.conversation_loop: API call
 /// #69: model=m provider=p in=243703 out=1521 total=245224 latency=30.2s
@@ -206,8 +212,8 @@ fn parse_logged_call(line: &str) -> Option<(String, String, String, LoggedCall)>
             "provider" => provider = Some(value.to_string()),
             "in" => input = value.parse().ok()?,
             "out" => output = value.parse().ok()?,
-            // `cache=<read>/<prompt>`: the log's `in` is the whole prompt, the
-            // stored bucket keeps only the non-cached share.
+            // `cache=<read>/<prompt>`: the log's `in` is the whole prompt;
+            // cache reads and writes have separate stored buckets.
             "cache" => cache_read = value.split('/').next()?.parse().ok()?,
             "write" => cache_write = value.parse().ok()?,
             // total, latency, id, upstream: not needed for the split.
@@ -215,8 +221,9 @@ fn parse_logged_call(line: &str) -> Option<(String, String, String, LoggedCall)>
         }
     }
     let (model, provider) = (model?, provider?);
-    // The stored input bucket keeps only the non-cached share of the prompt.
-    let input = (input - cache_read).max(0);
+    // The log's `in` is the whole prompt. The stored input bucket excludes
+    // both cached and newly cache-written tokens, which have their own buckets.
+    let input = (input - cache_read - cache_write).max(0);
 
     // Prefix shape: "YYYY-MM-DD HH:MM:SS,mmm INFO [session_id]".
     let session_id = prefix.rsplit_once(" [")?.1.strip_suffix(']')?;
@@ -277,14 +284,16 @@ fn hermes_log_paths(db_path: &Path) -> Vec<PathBuf> {
 /// Index the per-call log lines for `sessions` only, keyed by
 /// (session, model, provider). Sessions the database never recorded are
 /// skipped: there is no row to allocate their tokens to, and indexing them
-/// would grow with every log rotation. Rotation can re-emit a call, so
-/// (session, call number) is deduplicated first-wins.
+/// would grow with every log rotation. Rotation can re-emit the same line, so
+/// its full call fingerprint is deduplicated first-wins. The call number alone
+/// is not an identity: Hermes resets `session_api_calls` when a resumed session
+/// gets a new agent process, so valid calls on different days can both be #1.
 fn load_logged_calls(
     db_path: &Path,
     sessions: &HashSet<String>,
 ) -> HashMap<(String, String, String), Vec<LoggedCall>> {
     let mut index: HashMap<(String, String, String), Vec<LoggedCall>> = HashMap::new();
-    let mut seen_calls: HashSet<(String, i64)> = HashSet::new();
+    let mut seen_calls: HashSet<LoggedCallFingerprint> = HashSet::new();
     for path in hermes_log_paths(db_path) {
         let Ok(file) = File::open(&path) else {
             continue;
@@ -296,7 +305,18 @@ fn load_logged_calls(
             if !sessions.contains(&session_id) {
                 continue;
             }
-            if !seen_calls.insert((session_id.clone(), call.call_number)) {
+            let fingerprint = (
+                session_id.clone(),
+                model.clone(),
+                provider.clone(),
+                call.call_number,
+                call.timestamp_ms,
+                call.input,
+                call.output,
+                call.cache_read,
+                call.cache_write,
+            );
+            if !seen_calls.insert(fingerprint) {
                 continue;
             }
             index
@@ -374,9 +394,9 @@ fn split_proportionally(total: i64, weights: &[i64], total_weight: i64) -> Vec<i
 /// Allocate one usage row's buckets across the days its logged calls fall in,
 /// grouped in `bucket_timezone`.
 ///
-/// Only the portion the logs actually account for is distributed: each bucket
-/// splits by the per-day token weights of the logged calls, and the remainder
-/// — rotated-away calls, or turns that never reach the log — stays on the
+/// Only the portion the logs actually account for is distributed: each logged
+/// call's exact buckets stay on its day, and the remainder — rotated-away
+/// calls, or turns that never reach the log — stays on the
 /// session's start day, so partial evidence can never pull a lifetime total
 /// onto one recent day.
 ///
@@ -404,52 +424,38 @@ fn allocate_row_by_days(
         return None;
     }
 
-    // Day buckets in day-key order (BTreeMap): a day's weight is the sum of its
-    // calls' tokens, its timestamp the day's first call. Weightless days carry
-    // nothing to attribute and are dropped.
-    let mut by_day: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    // Keep each logged bucket on the day that produced it. The database is
+    // still authoritative for the row totals, but an accepted log line carries
+    // exact per-call bucket counts, not merely an undifferentiated weight. Using
+    // one combined token ratio for every bucket would move cache-read tokens to
+    // output-heavy days (and output tokens to cache-heavy days).
+    let mut shares: BTreeMap<String, DayShare> = BTreeMap::new();
     for call in calls {
         let day_key = bucket_timezone.day_key(call.timestamp_ms);
         if day_key.is_empty() {
             return None;
         }
-        let day = by_day.entry(day_key).or_insert((call.timestamp_ms, 0));
-        day.0 = day.0.min(call.timestamp_ms);
-        day.1 += call.input + call.output + call.cache_read + call.cache_write;
+        let day = shares.entry(day_key.clone()).or_insert(DayShare {
+            day_key,
+            timestamp_ms: call.timestamp_ms,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            cost: 0.0,
+        });
+        day.timestamp_ms = day.timestamp_ms.min(call.timestamp_ms);
+        day.input += call.input;
+        day.output += call.output;
+        day.cache_read += call.cache_read;
+        day.cache_write += call.cache_write;
     }
-    let days: Vec<(String, i64, i64)> = by_day
-        .into_iter()
-        .map(|(key, (timestamp_ms, weight))| (key, timestamp_ms, weight))
-        .filter(|(_, _, weight)| *weight > 0)
-        .collect();
-    let total_weight: i64 = days.iter().map(|(_, _, weight)| *weight).sum();
-    if days.is_empty() || total_weight <= 0 {
+    shares.retain(|_, share| {
+        share.input > 0 || share.output > 0 || share.cache_read > 0 || share.cache_write > 0
+    });
+    if shares.is_empty() {
         return None;
-    }
-    let weights: Vec<i64> = days.iter().map(|(_, _, weight)| *weight).collect();
-
-    // Split only what the logs account for; the rest of each bucket rides the
-    // session's start day.
-    let input_parts = split_proportionally(log_input, &weights, total_weight);
-    let output_parts = split_proportionally(log_output, &weights, total_weight);
-    let cache_read_parts = split_proportionally(log_cache_read, &weights, total_weight);
-    let cache_write_parts = split_proportionally(log_cache_write, &weights, total_weight);
-
-    let mut shares: BTreeMap<String, DayShare> = BTreeMap::new();
-    for (i, (day_key, timestamp_ms, _)) in days.iter().enumerate() {
-        shares.insert(
-            day_key.clone(),
-            DayShare {
-                day_key: day_key.clone(),
-                timestamp_ms: *timestamp_ms,
-                input: input_parts[i],
-                output: output_parts[i],
-                cache_read: cache_read_parts[i],
-                cache_write: cache_write_parts[i],
-                reasoning: 0,
-                cost: 0.0,
-            },
-        );
     }
 
     // Whatever the logs could not account for stays on the start day, merged
@@ -712,6 +718,15 @@ pub fn parse_hermes_sqlite_in(
         .iter()
         .map(|row| row.session_id.clone())
         .collect();
+    // Current Hermes schemas persist a missing provider as `''`, whereas old
+    // nullable schemas can expose NULL. If both variants exist for one group,
+    // give the log's `provider=unknown` evidence to the current empty-string
+    // row only so it is never applied twice.
+    let empty_provider_groups: HashSet<(String, String)> = per_model_rows
+        .iter()
+        .filter(|row| row.billing_provider.as_deref() == Some(""))
+        .map(|row| (row.session_id.clone(), row.model_id.clone()))
+        .collect();
     let logged_calls = load_logged_calls(
         db_path,
         &per_model_rows
@@ -749,11 +764,18 @@ pub fn parse_hermes_sqlite_in(
             row.model_id,
             row.provider_key()
         );
+        let null_provider_is_shadowed = row.billing_provider.is_none()
+            && empty_provider_groups.contains(&(row.session_id.clone(), row.model_id.clone()));
+        let log_provider_key = match row.billing_provider.as_deref() {
+            Some("") => UNKNOWN_LOG_PROVIDER_KEY,
+            None if !null_provider_is_shadowed => UNKNOWN_LOG_PROVIDER_KEY,
+            _ => row.provider_key(),
+        };
         let calls = logged_calls
             .get(&(
                 row.session_id.clone(),
                 row.model_id.clone(),
-                row.provider_key().to_string(),
+                log_provider_key.to_string(),
             ))
             .map(Vec::as_slice);
         push_row_messages(
@@ -788,11 +810,15 @@ pub fn parse_hermes_sqlite_in(
         // This path emits at most one row per session, so it keeps the bare
         // session id as its dedup key; the per-model keys are namespaced and
         // cannot collide with it.
+        let log_provider_key = match row.billing_provider.as_deref() {
+            None | Some("") => UNKNOWN_LOG_PROVIDER_KEY,
+            Some(provider) => provider,
+        };
         let calls = logged_calls
             .get(&(
                 row.session_id.clone(),
                 row.model_id.clone(),
-                row.provider_key().to_string(),
+                log_provider_key.to_string(),
             ))
             .map(Vec::as_slice);
         push_row_messages(
